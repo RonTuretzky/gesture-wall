@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Auto-downloaded model weights (~6 MB) and machine-specific calibration.
+models/
+calibration.json
