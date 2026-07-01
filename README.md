@@ -134,6 +134,13 @@ wall client to inject a local `id=-1` test cursor; press `f` for fullscreen.
 > (room-map → `Tracker` → `FusionEngine`, no cv2/asyncio), exercised headless by
 > `tests/test_server_pipeline.py` with a `FakeSource`.
 
+### Vibersyn on wall B
+
+The 2-wall setup can put the **Vibersyn** idea projector on wall B, driven by
+gestures on wall A. Wall A stays `web/wall.html` (add `&vibersyn=<url>` so dwell
+tiles POST to Vibersyn); wall B becomes `web/vibersyn.html?src=<vibersyn-url>`. See
+[VIBERSYN.md](VIBERSYN.md) and `./run-2wall-vibersyn.sh`.
+
 ## Controls
 
 | Key | Action |
