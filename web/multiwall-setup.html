@@ -33,7 +33,7 @@
     background:#000;color:#9fe;padding:.08em .4em;border-radius:5px;
     font-size:.86em;border:1px solid #2a2a34}
   pre{background:#0c0c11;border:1px solid var(--line);border-radius:12px;
-    padding:18px 20px;overflow:auto;margin:0;max-height:62vh}
+    padding:18px 20px;overflow:auto;margin:0;max-height:54vh}
   pre code{background:none;border:none;color:#cfe;padding:0;font-size:clamp(12px,1.25vw,16px);line-height:1.5}
   .tag{display:inline-block;font-size:.72em;font-weight:700;padding:.2em .6em;
     border-radius:999px;vertical-align:middle}
@@ -63,6 +63,10 @@
   .legend{display:flex;gap:22px;flex-wrap:wrap;margin-top:1.5vh;font-size:clamp(13px,1.4vw,18px)}
   .legend span{display:inline-flex;align-items:center;gap:8px;color:#cdd}
   .sw{width:14px;height:14px;border-radius:4px;display:inline-block}
+  .why{margin-top:1.4vh;border-left:3px solid var(--accent);background:rgba(60,200,220,.07);
+    padding:.55em .95em;border-radius:0 9px 9px 0;font-size:clamp(13px,1.45vw,20px);
+    line-height:1.45;color:#cfe6ec}
+  .why b{color:var(--accent);letter-spacing:.02em}
 </style>
 </head>
 <body>
@@ -89,6 +93,8 @@
         <span><i class="sw" style="background:var(--accent)"></i> wall (display)</span>
         <span><i class="sw" style="background:var(--accent2)"></i> sensing server (fusion)</span>
       </div>
+      <p class="why"><b>Why this shape →</b> a corner puts two big targets inside one arm-sweep of a user
+        who barely moves, and the seam gives the cameras a natural overlap to hand off through.</p>
     </div>
   </section>
 
@@ -105,6 +111,7 @@
           <li>The glue is a <b>homography</b> <code>H<sub>cam→wall</sub></code> — exactly the 4-corner calibration you already have, one per camera/wall pair.</li>
         </ul>
         <p class="note">A camera never “owns” a wall. It just reports where a hand is; a fusion step decides which wall that means and routes it there.</p>
+        <p class="why"><b>Why split them →</b> you can add, move, or recalibrate one camera or wall without touching the rest — only its homography changes. Glued together, every change is a rebuild.</p>
       </div>
       <figure>
         <svg viewBox="0 0 420 260" role="img" aria-label="sensing to display">
@@ -147,6 +154,7 @@ cam1 → wallA        (cam1 sees the corner seam)
 cam1 → wallB
 cam2 → wallB</code></pre>
         <p class="pill">4 homographies — not 6. cam0 never covers Wall B, cam2 never covers Wall A. A cursor crossing the seam hands off cam0→cam2 via cam1.</p>
+        <p class="why"><b>Why three frames →</b> separating image from wall keeps every camera’s calibration independent and the walls resolution-independent; the optional room frame is only needed to recognise the <i>same person</i> in two overlapping cameras.</p>
       </div>
     </div>
   </section>
@@ -159,26 +167,35 @@ cam2 → wallB</code></pre>
       <div>
         <ul>
           <li>Run <b>two wall clients</b> (the web app, fullscreen), one per projector — but calibrated so they’re <b>continuous at the seam</b>: A’s right edge = B’s left edge.</li>
-          <li>Each still has its <b>own zone grid</b> + dwell — e.g. <code>A: 2×3</code>, <code>B: 2×2</code> — but tiles can sit right up to the seam since the surfaces abut.</li>
+          <li>Both walls run the <b>same grid</b> (<code>2×3</code>) + their own dwell state — tiles can sit right up to the seam since the surfaces abut.</li>
           <li>A wall doesn’t read a camera. It <b>receives a cursor</b> <code>{x,y,engaged}</code> in its own coords; the server decides A vs B and hands off across the seam.</li>
           <li>Drive both from <b>one host</b> via an <b>extended desktop</b> — projector 1 on display 1, projector 2 on display 2.</li>
         </ul>
         <p class="note">Tiny change to the current app: add a <b>“remote pointer” source</b> that takes <code>{x,y,engaged}</code> off a WebSocket instead of the local webcam.</p>
+        <p class="why"><b>Why calibrate them continuous →</b> if A’s right edge and B’s left edge line up, a target on the corner reads as one surface and the cursor doesn’t teleport at the seam — users never sense it’s two systems.</p>
       </div>
       <figure>
-        <svg viewBox="0 0 440 250" role="img" aria-label="two connected walls">
-          <!-- abutting walls sharing a seam -->
-          <rect x="40" y="45" width="170" height="120" rx="6" fill="rgba(60,200,220,.06)" stroke="var(--accent)" stroke-width="2"/>
-          <rect x="210" y="45" width="150" height="120" rx="6" fill="rgba(60,200,220,.06)" stroke="var(--accent)" stroke-width="2"/>
-          <text x="125" y="35" fill="var(--accent)" font-size="15" text-anchor="middle">Wall A · 2×3</text>
-          <text x="285" y="35" fill="var(--accent)" font-size="15" text-anchor="middle">Wall B · 2×2</text>
-          <g stroke="#2f6f7a"><line x1="40" y1="85" x2="210" y2="85"/><line x1="40" y1="125" x2="210" y2="125"/><line x1="96" y1="45" x2="96" y2="165"/><line x1="153" y1="45" x2="153" y2="165"/></g>
-          <g stroke="#2f6f7a"><line x1="210" y1="105" x2="360" y2="105"/><line x1="285" y1="45" x2="285" y2="165"/></g>
-          <!-- seam -->
-          <line x1="210" y1="38" x2="210" y2="178" stroke="var(--warn)" stroke-width="3" stroke-dasharray="5 4"/>
-          <text x="210" y="196" fill="var(--warn)" font-size="13" text-anchor="middle">seam · A.x=1 ≡ B.x=0</text>
-          <path d="M170 200 C 200 214, 220 214, 250 200" stroke="#9fd9af" stroke-width="2" fill="none" marker-end="url(#s)"/>
-          <text x="220" y="232" fill="#9aa" font-size="12" text-anchor="middle">cursor crosses the seam smoothly</text>
+        <svg viewBox="0 0 440 250" role="img" aria-label="two connected walls forming an inside corner">
+          <!-- inside corner: two wall faces meeting at a shared vertical seam (center) -->
+          <polygon points="220,40 60,70 60,200 220,150" fill="rgba(60,200,220,.07)" stroke="var(--accent)" stroke-width="2"/>
+          <polygon points="220,40 380,70 380,200 220,150" fill="rgba(60,200,220,.04)" stroke="var(--accent)" stroke-width="2"/>
+          <!-- Wall A grid 2×3 -->
+          <g stroke="#2f6f7a" stroke-width="1">
+            <line x1="166.7" y1="50" x2="166.7" y2="166.7"/><line x1="113.3" y1="60" x2="113.3" y2="183.3"/>
+            <line x1="220" y1="95" x2="60" y2="135"/>
+          </g>
+          <!-- Wall B grid 2×3 -->
+          <g stroke="#2f6f7a" stroke-width="1">
+            <line x1="273.3" y1="50" x2="273.3" y2="166.7"/><line x1="326.7" y1="60" x2="326.7" y2="183.3"/>
+            <line x1="220" y1="95" x2="380" y2="135"/>
+          </g>
+          <!-- shared vertical seam (the corner edge) -->
+          <line x1="220" y1="40" x2="220" y2="150" stroke="var(--warn)" stroke-width="3" stroke-dasharray="5 4"/>
+          <text x="232" y="34" fill="var(--warn)" font-size="12">seam = the corner</text>
+          <text x="125" y="138" fill="var(--accent)" font-size="15" text-anchor="middle">Wall A · 2×3</text>
+          <text x="315" y="138" fill="var(--accent)" font-size="15" text-anchor="middle">Wall B · 2×3</text>
+          <path d="M150 176 C 195 196, 245 196, 300 178" stroke="#9fd9af" stroke-width="2" fill="none" marker-end="url(#s)"/>
+          <text x="220" y="232" fill="#9aa" font-size="12" text-anchor="middle">A.x=1 ≡ B.x=0 — cursor wraps the corner smoothly</text>
           <defs><marker id="s" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0 0L7 3L0 6z" fill="#9fd9af"/></marker></defs>
         </svg>
       </figure>
@@ -192,27 +209,30 @@ cam2 → wallB</code></pre>
     <div class="cols">
       <div>
         <ul>
+          <li><b>Each projector faces its own wall.</b> It sits out in the room in front of that face, firing square onto it — ceiling-mounted short-throw is cleanest, so the user doesn’t cast a shadow. The two beams meet at the corner.</li>
           <li><b>Extended desktop, not mirrored.</b> Each projector is its own display; place display 2 immediately right of display 1 so the OS coordinate space is continuous.</li>
           <li><b>Butt or overlap at the seam.</b> Either edge-to-edge (simplest) or a small <b>overlap with edge-blend</b> so there’s no bright line and no gap where tiles would fall through.</li>
           <li><b>Match brightness &amp; keystone</b> on both so a tile straddling the seam reads as one tile.</li>
           <li><b>Then calibrate cameras to the projected image</b> — corners are calibrated to what you actually see on the wall, so projector alignment must be locked first.</li>
         </ul>
         <p class="note">Order matters: <b>geometry → projector alignment → camera calibration → run.</b> Re-aligning a projector later means re-calibrating that wall’s cameras.</p>
+        <p class="why"><b>Why align first →</b> cameras are calibrated to the <i>projected</i> corners. If the image shifts, every camera mapping is wrong; and a bright seam line or a gap would split a corner tile so it can’t be pointed at cleanly.</p>
       </div>
       <figure>
-        <svg viewBox="0 0 420 240" role="img" aria-label="projector alignment">
-          <g fill="none" stroke-width="2">
-            <rect x="30" y="120" width="60" height="40" rx="6" stroke="#789"/><text x="60" y="180" fill="#9ab" font-size="12" text-anchor="middle">proj 1</text>
-            <rect x="330" y="120" width="60" height="40" rx="6" stroke="#789"/><text x="360" y="180" fill="#9ab" font-size="12" text-anchor="middle">proj 2</text>
-          </g>
-          <path d="M90 130 L150 40 L260 40" stroke="rgba(60,200,220,.5)" fill="rgba(60,200,220,.06)"/>
-          <path d="M330 130 L270 40 L160 40" stroke="rgba(60,200,220,.5)" fill="rgba(60,200,220,.06)"/>
-          <rect x="150" y="40" width="120" height="70" fill="rgba(224,169,60,.10)" stroke="var(--warn)" stroke-dasharray="4 3"/>
-          <text x="210" y="32" fill="var(--warn)" font-size="12" text-anchor="middle">blend / butt region</text>
-          <rect x="40" y="40" width="110" height="70" fill="none" stroke="var(--accent)"/>
-          <rect x="270" y="40" width="110" height="70" fill="none" stroke="var(--accent)"/>
-          <text x="95" y="80" fill="#9fe" font-size="12" text-anchor="middle">Wall A</text>
-          <text x="325" y="80" fill="#9fe" font-size="12" text-anchor="middle">Wall B</text>
+        <svg viewBox="0 0 440 260" role="img" aria-label="two projectors each facing one wall of the corner">
+          <!-- inside corner faces meeting at the seam (same view as the walls slide) -->
+          <polygon points="220,30 70,55 70,165 220,130" fill="rgba(60,200,220,.06)" stroke="var(--accent)" stroke-width="2"/>
+          <polygon points="220,30 370,55 370,165 220,130" fill="rgba(60,200,220,.05)" stroke="var(--accent)" stroke-width="2"/>
+          <!-- each projector sits in front, facing its wall; beam fans across the whole face -->
+          <path d="M120 224 L74 66 L214 124 Z" fill="rgba(224,169,60,.12)" stroke="rgba(224,169,60,.4)"/>
+          <path d="M320 224 L366 66 L226 124 Z" fill="rgba(224,169,60,.12)" stroke="rgba(224,169,60,.4)"/>
+          <rect x="95" y="224" width="50" height="26" rx="6" fill="none" stroke="#9ab"/><text x="120" y="242" fill="#9ab" font-size="11" text-anchor="middle">proj 1</text>
+          <rect x="295" y="224" width="50" height="26" rx="6" fill="none" stroke="#9ab"/><text x="320" y="242" fill="#9ab" font-size="11" text-anchor="middle">proj 2</text>
+          <!-- seam where the two faces (and beams) meet -->
+          <line x1="220" y1="30" x2="220" y2="130" stroke="var(--warn)" stroke-width="3" stroke-dasharray="5 4"/>
+          <text x="232" y="26" fill="var(--warn)" font-size="11">seam · beams blend here</text>
+          <text x="135" y="98" fill="#9fe" font-size="13" text-anchor="middle">Wall A</text>
+          <text x="305" y="98" fill="#9fe" font-size="13" text-anchor="middle">Wall B</text>
         </svg>
       </figure>
     </div>
@@ -224,34 +244,39 @@ cam2 → wallB</code></pre>
     <h2>Sides for reach, center for the seam</h2>
     <div class="cols">
       <div>
-        <p>With the walls joined, place the cameras around the connected surface:</p>
+        <p>Like the single-cam app, <b>each camera sits at its wall and faces the user</b> (not the wall). The user stands in the pocket facing the corner:</p>
         <ul>
-          <li><b>cam0</b> — off to one side, looking across <span class="tag wall">Wall A</span> so its far edge isn’t a steep oblique angle.</li>
-          <li><b>cam2</b> — mirror of cam0 on the other side, covering <span class="tag wall">Wall B</span>.</li>
-          <li><b>cam1</b> — facing the <b>seam/corner</b>: it sees both inner edges, so it owns the handoff and is the <b>occlusion fallback</b> when a body hides itself from a side camera.</li>
+          <li><b>cam0</b> — mounted on <span class="tag wall">Wall A</span>, looking back across the pocket at the user so A’s far edge isn’t a steep oblique angle.</li>
+          <li><b>cam2</b> — mirror of cam0 on <span class="tag wall">Wall B</span>.</li>
+          <li><b>cam1</b> — at the <b>corner/seam</b>, looking straight out at the user: sees both inner edges, owns the handoff, and is the <b>occlusion fallback</b>.</li>
         </ul>
-        <p>This directly fixes the prototype’s weak spot: a lone oblique camera makes the far side of a wide surface imprecise. Each wall’s far region now has a square-on second viewpoint.</p>
+        <p>This fixes the prototype’s weak spot — a lone oblique camera makes the far side imprecise — by giving each wall’s far region a square-on second viewpoint.</p>
+        <p class="why"><b>Why face the user →</b> pose tracking needs a frontal view of the body and the raised arm; a camera aimed at the wall would only see the user’s back. Side + corner placement keeps every region near square-on (accurate pointing) and means a body that hides itself from one camera is still seen by another.</p>
       </div>
       <figure>
-        <svg viewBox="0 0 440 280" role="img" aria-label="camera placement on connected walls">
-          <!-- connected walls drawn as an open corner (plan view) -->
-          <line x1="40" y1="40" x2="220" y2="40" stroke="var(--accent)" stroke-width="5"/>
-          <line x1="220" y1="40" x2="400" y2="40" stroke="var(--accent)" stroke-width="5"/>
-          <line x1="220" y1="28" x2="220" y2="52" stroke="var(--warn)" stroke-width="3" stroke-dasharray="4 3"/>
-          <text x="120" y="24" fill="var(--accent)" font-size="13" text-anchor="middle">Wall A</text>
-          <text x="320" y="24" fill="var(--accent)" font-size="13" text-anchor="middle">Wall B</text>
-          <text x="220" y="68" fill="var(--warn)" font-size="11" text-anchor="middle">seam</text>
-          <!-- cameras -->
-          <g fill="var(--camera)"><circle cx="70" cy="225" r="9"/><circle cx="220" cy="250" r="9"/><circle cx="370" cy="225" r="9"/></g>
-          <text x="70" y="248" fill="#dca9ec" font-size="12" text-anchor="middle">cam0</text>
-          <text x="220" y="273" fill="#dca9ec" font-size="12" text-anchor="middle">cam1</text>
-          <text x="370" y="248" fill="#dca9ec" font-size="12" text-anchor="middle">cam2</text>
-          <g fill="rgba(200,120,220,.10)" stroke="rgba(200,120,220,.45)">
-            <path d="M70 216 L40 46 L230 46 Z"/>
-            <path d="M370 216 L210 46 L400 46 Z"/>
-            <path d="M220 241 L150 46 L290 46 Z"/>
+        <svg viewBox="0 0 460 300" role="img" aria-label="camera placement around a corner, top-down plan">
+          <!-- 90° corner walls (top-down); apex = corner/seam at the back -->
+          <line x1="230" y1="55" x2="110" y2="175" stroke="var(--accent)" stroke-width="5"/>
+          <line x1="230" y1="55" x2="350" y2="175" stroke="var(--accent)" stroke-width="5"/>
+          <line x1="222" y1="48" x2="238" y2="48" stroke="var(--warn)" stroke-width="3"/>
+          <text x="230" y="40" fill="var(--warn)" font-size="11" text-anchor="middle">corner / seam</text>
+          <text x="138" y="160" fill="var(--accent)" font-size="13" text-anchor="middle">Wall A</text>
+          <text x="322" y="160" fill="var(--accent)" font-size="13" text-anchor="middle">Wall B</text>
+          <!-- FOV cones: each camera looks out from its wall and is aimed AT the user -->
+          <g fill="rgba(200,120,220,.10)" stroke="rgba(200,120,220,.4)">
+            <path d="M176 118 L179 248 L289 248 Z"/>
+            <path d="M284 118 L171 248 L281 248 Z"/>
+            <path d="M230 78 L170 248 L290 248 Z"/>
           </g>
-          <text x="220" y="120" fill="#cdd" font-size="12" text-anchor="middle">cam1 → seam handoff</text>
+          <!-- cameras mounted at the walls / corner -->
+          <g fill="var(--camera)"><circle cx="176" cy="112" r="8"/><circle cx="284" cy="112" r="8"/><circle cx="230" cy="72" r="8"/></g>
+          <text x="162" y="108" fill="#dca9ec" font-size="12" text-anchor="end">cam0</text>
+          <text x="298" y="108" fill="#dca9ec" font-size="12" text-anchor="start">cam2</text>
+          <text x="248" y="70" fill="#dca9ec" font-size="12" text-anchor="start">cam1</text>
+          <!-- user -->
+          <circle cx="230" cy="240" r="7" fill="#cdd"/>
+          <text x="230" y="262" fill="#9aa" font-size="11" text-anchor="middle">user faces the corner</text>
+          <text x="230" y="282" fill="#789" font-size="10" text-anchor="middle">top-down plan · each camera sits at its wall, looking back at the user</text>
         </svg>
       </figure>
     </div>
@@ -271,6 +296,7 @@ cam2 → wallB</code></pre>
           <li><b>Fuse per wall:</b> if two cameras see the same wall, combine — pick <b>highest landmark confidence</b>, or average if they agree within a few cm.</li>
         </ol>
         <p class="pill">Result the wall client receives: <code>{wall:"A", x, y, engaged}</code>. Smoothing &amp; dwell stay on the client, unchanged.</p>
+        <p class="why"><b>Why fuse centrally →</b> collapsing many camera views into one cursor per wall is the only place that can resolve disagreement — without it, two views of the same hand would fight and the seam would flicker between walls.</p>
       </div>
       <figure>
         <svg viewBox="0 0 420 260" role="img" aria-label="fusion">
@@ -311,6 +337,7 @@ cam2 → wallB</code></pre>
           <li><span class="tag wall">Wall clients</span> — two browser tabs of the existing web app, each fullscreen on a projector, each subscribed to its wall’s events.</li>
         </ul>
         <p>Keep <b>filter + dwell + render on the client</b> (already built) so the server stays a thin sensing/fusion service. Latency target: pose at ~30 fps per camera, events pushed as produced.</p>
+        <p class="why"><b>Why a server + clients →</b> a browser tab can’t open three cameras and own two fullscreen displays at once. One server centralises all sensing and fusion; the walls stay the unmodified web app, just fed pointers — less code, lower latency, one place to debug.</p>
       </div>
       <figure>
         <svg viewBox="0 0 440 250" role="img" aria-label="architecture">
@@ -341,7 +368,7 @@ cam2 → wallB</code></pre>
         <pre><code>{
   "walls": {
     "A": { "display": 1, "grid": {"rows":2,"cols":3} },
-    "B": { "display": 2, "grid": {"rows":2,"cols":2} }
+    "B": { "display": 2, "grid": {"rows":2,"cols":3} }
   },
   "adjacency": [
     { "left": "A", "right": "B", "seam_margin": 0.06 }
@@ -369,6 +396,7 @@ cam2 → wallB</code></pre>
           <li><code>fusion</code>: <code>highest_confidence</code> is the safe default; <code>average</code> when two views agree.</li>
         </ul>
         <p class="note">This is a clean superset of today’s app: one camera, one wall, one matrix is just the 1×1 case of this file.</p>
+        <p class="why"><b>Why one declarative file →</b> the whole room is reproducible and diffable, and because the single-wall case is just a subset, no code has to special-case “1 wall” vs “2 walls”.</p>
       </div>
     </div>
   </section>
@@ -396,6 +424,7 @@ cam2 → wallB</code></pre>
           <div><span class="tag cam">cam2</span>→<span class="tag wall">B</span> <span class="ok">✓</span></div>
         </div>
         <p class="pill">cam0→B and cam2→A are intentionally absent — those cameras don’t cover the far wall.</p>
+        <p class="why"><b>Why per-pair, from the standing spot →</b> the homography encodes one camera’s exact view of one wall, captured from where users actually stand — so calibrating from the real vantage point is what makes pointing land where they expect. The seam check then guarantees the two walls join cleanly.</p>
       </div>
     </div>
   </section>
@@ -413,6 +442,7 @@ cam2 → wallB</code></pre>
         <div class="card"><b>Occlusion.</b> Person blocks themselves from cam0. Fix: that’s why cam1 exists — fusion falls back to whichever camera still sees the body.</div>
         <div class="card"><b>Latency / sync.</b> Per-camera pose at 30 fps; stamp every observation with a time and fuse only recent ones (drop &gt;100 ms old) so a stalled camera can’t freeze a wall.</div>
         <div class="card"><b>Multi-user.</b> Raise <code>num_poses</code> and match people across cameras in the room frame before fusing — otherwise two users blur into one cursor.</div>
+        <p class="why"><b>Why design for these now →</b> every one is a predictable consequence of the physical layout — overlap, occlusion, network jitter. Building the margins and timeouts in up front is far cheaper than diagnosing them live in a room full of people.</p>
       </div>
     </div>
   </section>
@@ -443,6 +473,7 @@ cam2 → wallB</code></pre>
           </ul>
         </div>
         <p class="lede" style="font-size:clamp(15px,1.7vw,22px)">Order is everything: <b>align projectors → calibrate cameras → run.</b></p>
+        <p class="why"><b>Why build it incrementally →</b> bringing up one wall, then two, then fusion means each new failure has exactly one possible cause — you always know what just broke.</p>
       </div>
     </div>
   </section>

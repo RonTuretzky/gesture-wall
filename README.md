@@ -75,6 +75,65 @@ On first run with `--source pose`, the PoseLandmarker model is auto-downloaded
 to `models/`. Calibration is a one-time "point at each of the 4 corners and press
 SPACE" step; the result is saved to `calibration.json` and reused next time.
 
+## Multi-wall / multi-user
+
+The single-wall app above is one camera, one wall, one person. The
+**multi-wall pipeline** fuses several cameras into a shared room frame, tracks
+multiple people across cameras + time, and streams each projected wall **only
+its own cursors** over websockets. Several people can point at several walls at
+once.
+
+```
+cameras → MultiPoseSource → Persons → room-homography → RoomObs
+       → Tracker (fuse bodies across cameras/time) → Tracks
+       → FusionEngine (per-wall cursors, seam hysteresis) → websocket → wall.html
+```
+
+**1. Describe the room** — copy `room.example.json` to `room.json` and edit the
+walls / displays / grid / cameras / fusion / server blocks. Each camera lists the
+walls it `serves`; calibration matrices live under `calibration["<cam>-><wall>"]`.
+
+**2. Calibrate (on the hardware with the cameras attached).** For every
+`(camera, wall)` pair, point at the 4 wall corners and press **SPACE**:
+
+```bash
+.venv/bin/python -m gesturewall.calibrate --config room.json --camera cam0 --wall A
+.venv/bin/python -m gesturewall.calibrate --config room.json --camera cam1 --wall A
+.venv/bin/python -m gesturewall.calibrate --config room.json --camera cam1 --wall B
+.venv/bin/python -m gesturewall.calibrate --config room.json --camera cam2 --wall B
+# Optional per-camera floor reference (builds room_homography for cross-camera fusion):
+.venv/bin/python -m gesturewall.calibrate --config room.json --floor cam1
+```
+
+Each run writes the resulting 3×3 matrix back into `room.json`. (Cameras with a
+`null` room_homography fall back to using the hip anchor directly as the room
+coordinate, which is fine for a single-camera-per-wall layout.)
+
+**3. Run the server** (websocket fan-out + serves `web/` over http so clients
+load from the same origin):
+
+```bash
+.venv/bin/python -m gesturewall.server --config room.json
+# overrides: --ws-port 8770 --http-port 8000 --fps 30 --num-poses 4
+```
+
+**4. Open one wall client per projector** (from the http origin the server
+serves, e.g. `http://localhost:8000`):
+
+```
+web/wall.html?wall=A&server=ws://localhost:8770&rows=2&cols=3   → projector 1
+web/wall.html?wall=B&server=ws://localhost:8770&rows=2&cols=3   → projector 2
+```
+
+Each client subscribes to its wall, renders every active cursor in a distinct
+color with its own dwell ring + id badge, and a **shared per-zone lock** stops
+two people double-toggling the same tile. No camera handy? Move the mouse over a
+wall client to inject a local `id=-1` test cursor; press `f` for fullscreen.
+
+> The camera-free heart of the server is `gesturewall.server.step_pipeline`
+> (room-map → `Tracker` → `FusionEngine`, no cv2/asyncio), exercised headless by
+> `tests/test_server_pipeline.py` with a `FakeSource`.
+
 ## Controls
 
 | Key | Action |
