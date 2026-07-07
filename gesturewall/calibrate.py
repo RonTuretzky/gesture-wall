@@ -240,8 +240,17 @@ def load_config_dict(path: str | Path) -> dict:
 
 
 def save_config_dict(path: str | Path, config_dict: dict) -> None:
-    """Write a room config dict back to JSON with stable, readable formatting."""
-    Path(path).write_text(json.dumps(config_dict, indent=2) + "\n")
+    """Write a room config dict back to JSON, atomically.
+
+    Writes a sibling temp file then ``os.replace`` (atomic on the same
+    filesystem), so a crash mid-write can never leave the live config — which
+    every other tool loads — truncated or half-written.
+    """
+    import os
+    path = Path(path)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(config_dict, indent=2) + "\n")
+    os.replace(tmp, path)
 
 
 # --------------------------------------------------------------------------- #

@@ -550,7 +550,17 @@ class GestureServer:
         Returns the per-wall cursors produced (handy for tests/inspection).
         """
         now = self.store_time()
-        persons = self.store.snapshot(now, self.config.fusion.track_max_age)
+        # Snapshot freshness is deliberately TIGHTER than track_max_age: a
+        # camera that stops producing (stall, occlusion) leaves cursor fusion
+        # within ~2.5 frame periods instead of freezing the cursor at its last
+        # ray for the full track lifetime — while track identity still
+        # survives track_max_age so the id doesn't churn.
+        # Floor at 200 ms: pose inference can run slower than the broadcast
+        # fps (heavy model), and a window tighter than the camera's own
+        # cadence would flicker healthy detections in and out.
+        fresh = min(self.config.fusion.track_max_age,
+                    max(2.5 / max(1, self.config.server.fps), 0.2))
+        persons = self.store.snapshot(now, fresh)
         cursors_by_wall = self.pipeline.step(persons, now)
 
         for wall, cursors in cursors_by_wall.items():

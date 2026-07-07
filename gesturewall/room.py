@@ -79,7 +79,7 @@ class CameraCfg:
     homography-mode cameras are unchanged.
     """
 
-    device: int
+    device: int | str  # int = enumeration index; str = a stable 12-digit serial
     serves: list[str]
     room_homography: Matrix | None = None
     kind: str = "rgb"
@@ -493,7 +493,13 @@ def _parse_cameras(raw: object) -> dict[str, CameraCfg]:
     for cam_id, craw in raw.items():
         _require(isinstance(craw, dict),
                  f"camera {cam_id!r} must be an object")
-        device = _as_int(craw.get("device"), f"camera {cam_id!r} device")
+        raw_device = craw.get("device")
+        if isinstance(raw_device, str):
+            _require(len(raw_device) > 0,
+                     f"camera {cam_id!r} device serial must be a non-empty string")
+            device = raw_device  # stable Kinect serial (index-independent)
+        else:
+            device = _as_int(raw_device, f"camera {cam_id!r} device")
         serves = craw.get("serves", [])
         _require(isinstance(serves, list)
                  and all(isinstance(s, str) for s in serves),

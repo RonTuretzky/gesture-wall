@@ -1,0 +1,275 @@
+"""Synthetic end-to-end tests for the projector-marker auto-calibration.
+
+No hardware: we render fake camera frames with a magenta disc, give them a
+synthetic depth map of a known planar wall, and check the pure pipeline
+(detect -> deproject -> fit -> register) recovers the geometry.
+"""
+import math
+
+import numpy as np
+import pytest
+
+from gesturewall.autocal import (MARKER_GRID, AutoCalibrator,
+                                 constrained_corner_fit, detect_marker,
+                                 lateral_spread, marker_point3, median_frame,
+                                 out_of_plane_spread, plane_angle_deg,
+                                 plane_metrics, plane_point, reject_off_plane,
+                                 robust_register)
+from gesturewall.geometry import (CameraIntrinsics, Extrinsic, fit_wall_plane,
+                                  rigid_transform_from_points)
+
+INTR = CameraIntrinsics(fx=366.0, fy=366.0, cx=256.0, cy=212.0,
+                        width=512, height=424)
+
+
+def scene(disc_at=None, radius=14, noise_seed=7):
+    """A busy-ish BGR frame; optionally with a magenta disc at (px, py)."""
+    rng = np.random.default_rng(noise_seed)
+    img = rng.integers(30, 90, size=(424, 512, 3), dtype=np.uint8)
+    img[100:200, 60:180] = (200, 210, 205)      # a bright "window"
+    if disc_at is not None:
+        yy, xx = np.mgrid[0:424, 0:512]
+        m = (xx - disc_at[0]) ** 2 + (yy - disc_at[1]) ** 2 <= radius ** 2
+        img[m] = (255, 40, 255)                  # magenta in BGR
+    return img
+
+
+def test_detect_marker_finds_disc_center():
+    off = scene()
+    on = scene(disc_at=(300, 150))
+    det = detect_marker(off, on)
+    assert det is not None
+    px, py, peak = det
+    assert abs(px - 300) < 2 and abs(py - 150) < 2
+    assert peak > 100
+
+
+def test_detect_marker_none_when_no_change():
+    off = scene()
+    on = scene()
+    assert detect_marker(off, on) is None
+
+
+def test_detect_marker_ignores_green_change():
+    off = scene()
+    on = scene()
+    on[200:260, 200:260, 1] = 255  # a big green change (not the disc)
+    assert detect_marker(off, on) is None
+
+
+def test_detect_marker_rejects_person_sized_blob():
+    # A realistic person: a large SKIN-colored change (high R, some G, low B).
+    # Bright and large, but blue barely rises -> magenta-balance gate rejects.
+    off = scene()
+    on = scene()
+    on[60:360, 120:360] = (55, 150, 210)  # BGR skin-ish; not magenta
+    assert detect_marker(off, on) is None
+
+
+def test_detect_marker_accepts_large_oblique_disc():
+    # The wall-B failure mode: a big magenta disc (blooming) must still pass.
+    off = scene()
+    on = scene(disc_at=(256, 212), radius=95)  # ~28k px, like the real bloom
+    det = detect_marker(off, on)
+    assert det is not None
+    px, py, _ = det
+    assert abs(px - 256) < 6 and abs(py - 212) < 6
+
+
+def test_detect_marker_rejects_two_comparable_blobs():
+    off = scene()
+    on = scene(disc_at=(300, 150))
+    yy, xx = np.mgrid[0:424, 0:512]
+    m = (xx - 120) ** 2 + (yy - 300) ** 2 <= 14 ** 2  # a second equal disc
+    on[m] = (255, 40, 255)
+    assert detect_marker(off, on) is None
+
+
+def test_lateral_spread_collinear_vs_2d():
+    col = [(0.0, y, 3.0) for y in (0.0, 0.8, 1.6)]         # a vertical line
+    assert lateral_spread(col) < 1e-6
+    grid = [(u * 2.3, -v * 1.9, 3.0) for (u, v) in MARKER_GRID]
+    assert lateral_spread(grid) > 0.3
+
+
+def test_reject_off_plane_drops_outlier():
+    good = [(u, v, (u * 2.3, -v * 1.9, 3.0)) for (u, v) in MARKER_GRID]
+    # distinct (u,v) not in the grid, 1 m off the wall plane in z
+    outlier = (0.3, 0.7, (0.3 * 2.3, -0.7 * 1.9, 2.0))
+    kept, dropped = reject_off_plane(good + [outlier])
+    assert dropped == 1
+    assert all(math.isclose(p[2], 3.0) for (_, _, p) in kept)
+
+
+def test_median_frame_kills_flicker():
+    base = scene()
+    glitch = base.copy()
+    glitch[:] = 255
+    med = median_frame([base, base, glitch])
+    assert np.array_equal(med, base)
+
+
+def test_marker_point3_median_depth():
+    depth = np.full((424, 512), 2.5, dtype=np.float32)
+    bad = np.zeros((424, 512), dtype=np.float32)  # all-invalid frame
+    p = marker_point3(300.0, 150.0, [depth, bad, depth], INTR)
+    assert p is not None
+    assert abs(p[2] - 2.5) < 1e-6
+
+
+def synth_wall(origin, u_vec, v_vec):
+    return origin, u_vec, v_vec
+
+
+def test_full_pipeline_recovers_plane_and_extrinsic():
+    # A wall 2.5 m wide, 1.6 m tall, 2.8 m in front of the reference camera.
+    origin = np.array([-1.2, 0.9, 2.8])
+    u_vec = np.array([2.5, 0.0, 0.4])
+    v_vec = np.array([0.0, -1.6, 0.0])
+
+    # A second camera rotated 35 deg about Y and offset.
+    th = math.radians(35)
+    R = np.array([[math.cos(th), 0, math.sin(th)],
+                  [0, 1, 0],
+                  [-math.sin(th), 0, math.cos(th)]])
+    t = np.array([1.5, 0.1, 0.6])
+
+    ref_samples, cam2_samples = [], []
+    for (u, v) in MARKER_GRID:
+        p_room = origin + u * u_vec + v * v_vec
+        ref_samples.append((u, v, tuple(p_room)))
+        p_cam2 = R.T @ (p_room - t)  # room -> cam2 frame
+        cam2_samples.append((u, v, tuple(p_cam2)))
+
+    plane = fit_wall_plane(ref_samples)
+    w, h = plane_metrics(plane)
+    assert abs(w - np.linalg.norm(u_vec)) < 1e-6
+    assert abs(h - np.linalg.norm(v_vec)) < 1e-6
+
+    ext = rigid_transform_from_points(
+        [p for (_, _, p) in cam2_samples],
+        [p for (_, _, p) in ref_samples])
+    for (u, v, p_cam2), (_, _, p_room) in zip(cam2_samples, ref_samples):
+        assert math.dist(ext.apply(p_cam2), p_room) < 1e-6
+
+    # pooled fit (ref + transformed cam2) still recovers the same plane
+    pooled = ref_samples + [(u, v, ext.apply(p)) for (u, v, p) in cam2_samples]
+    plane2 = fit_wall_plane(pooled)
+    for (u, v) in ((0, 0), (1, 0), (1, 1), (0, 1)):
+        assert math.dist(plane_point(plane2, u, v),
+                         tuple(origin + u * u_vec + v * v_vec)) < 1e-6
+
+
+def _rigid(th, t):
+    import numpy as np
+    R = np.array([[math.cos(th), 0, math.sin(th)],
+                  [0, 1, 0], [-math.sin(th), 0, math.cos(th)]])
+    return R, np.asarray(t, float)
+
+
+def test_robust_register_drops_reflection_correspondences():
+    # Good correspondences span TWO perpendicular walls (a real corner rig ->
+    # non-coplanar, well-conditioned) plus 3 bad "reflection" ones tens of cm
+    # wrong. Must register from the good ones, dropping the reflections.
+    import numpy as np
+    R, t = _rigid(math.radians(28), [1.2, 0.05, 0.4])
+    good_room = [(u * 2.3, -v * 1.6, 2.9) for (u, v) in [(0, 0), (1, 0), (0, 1)]]
+    good_room += [(2.3, -v * 1.6, 2.9 - u * 2.6)      # perpendicular wall B
+                  for (u, v) in [(0.3, 0), (0.8, 0.5), (0.6, 1)]]
+    src = [tuple(R.T @ (np.array(p) - t)) for p in good_room]
+    dst = list(good_room)
+    for k in range(3):                                 # reflections
+        src.append(tuple(R.T @ (np.array([0.3 + 0.2 * k, -0.5, 2.6]) - t)))
+        dst.append((0.3 + 0.2 * k, -0.5, 2.0))
+    reg = robust_register(src, dst)
+    assert reg is not None
+    ext, kept, max_r = reg
+    assert kept == 6 and max_r < 0.02
+    for s, d in zip(src[:6], dst[:6]):
+        assert math.dist(ext.apply(s), d) < 0.02
+
+
+def test_robust_register_refuses_coplanar_single_wall():
+    # All correspondences on ONE wall (coplanar) -> ill-conditioned rotation ->
+    # must REFUSE (return None) rather than emit a tilted extrinsic.
+    import numpy as np
+    R, t = _rigid(math.radians(20), [0.8, 0.1, 0.3])
+    room = [(u * 2.4, -v * 1.5, 3.0)
+            for (u, v) in [(0, 0), (1, 0), (0.5, 0.5), (0, 1), (1, 1), (0.5, 1)]]
+    src = [tuple(R.T @ (np.array(p) - t)) for p in room]
+    assert robust_register(src, list(room)) is None
+
+
+def test_robust_register_rejects_all_bad():
+    # No consistent subset -> returns None rather than a garbage extrinsic.
+    import numpy as np
+    rng = np.random.default_rng(3)
+    src = [tuple(rng.normal(size=3)) for _ in range(6)]
+    dst = [tuple(rng.normal(size=3)) for _ in range(6)]
+    assert robust_register(src, dst) is None
+
+
+def test_constrained_corner_fit_recovers_true_wall():
+    # Anchor wall A: 2.46 m wide, 1.38 m tall, facing +z-ish.
+    from gesturewall.geometry import fit_wall_plane as _fit
+    import numpy as np
+    a_samples = [(u, v, (u * 2.46, -v * 1.38, 3.0)) for (u, v) in MARKER_GRID]
+    plane_a = _fit(a_samples)
+    # True wall B: perpendicular, shares the corner at x=2.46, 2.6 m along -z.
+    def b_true(u, v):
+        return (2.46, -v * 1.38, 3.0 - u * 2.6)
+    # cam sees B obliquely: add structured noise pushing points off-plane
+    rng = np.random.default_rng(11)
+    b_samples = []
+    for (u, v) in [(0.12, 0.15), (0.5, 0.15), (0.88, 0.5), (0.12, 0.85),
+                   (0.5, 0.85), (0.88, 0.85), (0.5, 0.5)]:
+        p = np.array(b_true(u, v)) + rng.normal(scale=0.04, size=3)
+        b_samples.append((u, v, tuple(p)))
+    plane_b = constrained_corner_fit(plane_a, b_samples)
+    w, h = plane_metrics(plane_b)
+    assert abs(w - 2.6) < 0.15          # width recovered
+    assert abs(h - 1.38) < 0.15         # height recovered
+    assert abs(plane_angle_deg(plane_a, plane_b) - 90.0) < 1e-6  # exact corner
+    # corners land near truth
+    for (u, v) in ((0, 0), (1, 0), (0, 1), (1, 1)):
+        assert math.dist(plane_point(plane_b, u, v), b_true(u, v)) < 0.12
+
+
+def test_plane_angle_corner():
+    a = fit_wall_plane([(u, v, (u * 2.3, -v * 1.9, 3.0))
+                        for (u, v) in MARKER_GRID])
+    b = fit_wall_plane([(u, v, (2.3, -v * 1.9, 3.0 - u * 2.6))
+                        for (u, v) in MARKER_GRID])
+    assert abs(plane_angle_deg(a, b) - 90.0) < 1e-6
+
+
+class FakeSource:
+    """Replays scripted (color, depth, intr) frames like KinectV2Source."""
+
+    def __init__(self, frames):
+        self.frames = list(frames)
+
+    def read(self, timeout=None):
+        if not self.frames:
+            return None
+        return self.frames.pop(0)
+
+    def close(self):
+        pass
+
+
+def test_cam_walls_default_and_restriction():
+    cams = {"cam0": FakeSource([]), "cam1": FakeSource([])}
+    c = AutoCalibrator("x", ["A", "B"], cams, cam_walls={"cam0": ["A"]})
+    assert c.cam_walls["cam0"] == {"A"}         # restricted to its own wall
+    assert c.cam_walls["cam1"] == {"A", "B"}    # unspecified -> sees all
+    c2 = AutoCalibrator("x", ["A", "B"], cams, cam_walls=None)
+    assert c2.cam_walls["cam0"] == {"A", "B"}   # None -> every camera sees all
+
+
+def test_capture_stall_returns_none():
+    calib = AutoCalibrator.__new__(AutoCalibrator)
+    calib.cameras = {"cam0": FakeSource([None])}
+    calib._lock = __import__("threading").Lock()
+    got = calib._capture("cam0", n_frames=2, deadline_s=0.2)
+    assert got is None

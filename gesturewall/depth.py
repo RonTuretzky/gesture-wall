@@ -39,6 +39,7 @@ from .geometry import (
     Ray,
     floor_xy,
     sample_depth,
+    v_norm,
     v_sub,
 )
 from .multipose import Person
@@ -94,7 +95,8 @@ def keypoints_from_landmarks(landmarks, width: int, height: int) -> dict:
 
 
 def _room_point(kp, depth_map, intr: CameraIntrinsics, extr: Extrinsic,
-                window: int = 7, prefer_near: bool = True):
+                window: int = 7, prefer_near: bool = True,
+                near_band: float = 0.20):
     """Sample depth at a keypoint pixel and lift it into the ROOM frame.
 
     Uses ``prefer_near`` (the body is the nearest surface at a body-joint pixel)
@@ -103,7 +105,8 @@ def _room_point(kp, depth_map, intr: CameraIntrinsics, extr: Extrinsic,
     ``None`` if the depth map has no valid sample at that pixel.
     """
     px, py, _vis = kp
-    depth_m = sample_depth(depth_map, px, py, window=window, prefer_near=prefer_near)
+    depth_m = sample_depth(depth_map, px, py, window=window,
+                           prefer_near=prefer_near, near_band=near_band)
     if depth_m is None:
         return None
     cam_pt = intr.deproject(px, py, depth_m)
@@ -173,9 +176,12 @@ def build_person3d(kps, depth_map, intr: CameraIntrinsics, extr: Extrinsic,
     eye_origin_kp = (eye_px[0], eye_px[1], 1.0)
 
     # --- room-frame 3D points -------------------------------------------- #
-    # The wrist is the thin/fast joint whose depth matters most and is noisiest,
-    # so sample it with a larger near-preferring window.
-    wrist_room = _room_point(wrist_kp, depth_map, intr, extr, window=11)
+    # The wrist is the thin/fast joint whose depth matters most and is noisiest.
+    # Keep its footprint SMALL (5px ≈ one wrist at 3-4.5 m) with a tight near
+    # cluster: a big window with a loose band snaps to the TORSO whenever the
+    # arm points away from the camera (the torso is nearer than the hand).
+    wrist_room = _room_point(wrist_kp, depth_map, intr, extr, window=5,
+                             near_band=0.10)
 
     shoulder_room = _room_point(shoulder_kp, depth_map, intr, extr)
 
@@ -227,9 +233,26 @@ def build_person3d(kps, depth_map, intr: CameraIntrinsics, extr: Extrinsic,
     shoulder_2d = _norm(shoulder_kp)
     anchor_2d = _norm(hip_kp)
 
-    # Engaged: pointing wrist above its shoulder in the IMAGE (py grows down) and
-    # a ray was built (always true here, since we returned None above otherwise).
+    # Engaged: the wrist is raised to (or near) shoulder height. The old
+    # image-only rule (wrist pixel above shoulder pixel) fails from a HIGH
+    # camera looking down — a horizontally-pointing arm projects BELOW the
+    # shoulder — so also accept the 3D test: wrist no more than 25 cm below
+    # the shoulder in the room frame (+y is down). A hanging arm sits ~45 cm
+    # below and stays disengaged.
     engaged = bool(wrist_kp[1] < shoulder_kp[1])
+    if not engaged and shoulder_room is not None:
+        engaged = (wrist_room[1] - shoulder_room[1]) < 0.25
+    # An occluded/hallucinated wrist (back view, arm behind torso) must never
+    # drive a cursor — MediaPipe still emits a landmark, but visibility is low.
+    if wrist_kp[2] < 0.5:
+        engaged = False
+
+    # A near-zero origin->wrist baseline means a foreshortened arm or a bad
+    # depth sample; its direction is numerically meaningless and produces wild
+    # grazing rays (u values of 20+ at the wall). Keep the Person for identity
+    # tracking, but never let a degenerate ray drive a cursor.
+    if v_norm(direction) < 0.25:
+        engaged = False
 
     # Confidence: mean visibility of wrist + both shoulders, reduced if any
     # required depth sample was missing (a missing shoulder/hip depth means a

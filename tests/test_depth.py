@@ -200,6 +200,51 @@ def test_build_person3d_engaged_only_when_wrist_above_shoulder():
     assert lowered.engaged is False
 
 
+def test_build_person3d_engaged_horizontal_arm_from_high_camera():
+    # A HIGH camera looking down projects a horizontally-pointing arm's wrist
+    # slightly BELOW the shoulder in the image — the old image-only rule said
+    # "not engaged". In 3D the wrist is well within 25 cm of shoulder height,
+    # so the new rule engages. (constant depth: y_room diff = px_diff/fy*z)
+    depth_map = np.full((HEIGHT, WIDTH), 2.0, dtype=float)
+    body = make_body(
+        l_eye=(0.45, 0.10, 1.0),
+        r_eye=(0.55, 0.10, 1.0),
+        l_shoulder=(0.40, 0.40, 1.0),
+        r_shoulder=(0.60, 0.40, 1.0),
+        l_wrist=(0.35, 0.70, 1.0),
+        r_wrist=(0.80, 0.45, 1.0),   # just BELOW shoulder in image (0.45>0.40)
+        l_hip=(0.45, 0.80, 1.0),
+        r_hip=(0.55, 0.80, 1.0),
+    )
+    person = build_person3d(
+        keypoints_from_landmarks(body, WIDTH, HEIGHT),
+        depth_map, INTR, Extrinsic.identity())
+    # image rule alone would fail; 3D margin (~0.12 m here) engages.
+    assert person.engaged is True
+
+
+def test_build_person3d_degenerate_ray_disengages():
+    # Wrist pixel ~coincides with the eye origin -> near-zero baseline. The
+    # image rule says engaged (wrist above shoulder), but a <25 cm ray is
+    # numerically meaningless and must not drive a cursor.
+    depth_map = np.full((HEIGHT, WIDTH), 2.0, dtype=float)
+    body = make_body(
+        l_eye=(0.45, 0.10, 1.0),
+        r_eye=(0.55, 0.10, 1.0),
+        l_shoulder=(0.40, 0.40, 1.0),
+        r_shoulder=(0.60, 0.40, 1.0),
+        l_wrist=(0.35, 0.70, 1.0),
+        r_wrist=(0.50, 0.11, 1.0),   # raised AND right at the eye midpoint
+        l_hip=(0.45, 0.80, 1.0),
+        r_hip=(0.55, 0.80, 1.0),
+    )
+    person = build_person3d(
+        keypoints_from_landmarks(body, WIDTH, HEIGHT),
+        depth_map, INTR, Extrinsic.identity())
+    assert person is not None          # still tracked (identity/fusion)
+    assert person.engaged is False     # but never a cursor from this ray
+
+
 def test_build_person3d_missing_depth_returns_none():
     # An all-zeros depth map has no valid samples (sample_depth ignores <= 0),
     # so neither the wrist nor the eye origin gets depth -> None.
