@@ -98,11 +98,18 @@ class Adjacency:
 
 @dataclass
 class FusionCfg:
-    """Cross-camera fusion tuning."""
+    """Cross-camera fusion tuning.
+
+    ``cross_camera=False`` declares the cameras' room frames UNREGISTERED
+    (each camera's extrinsic is identity in its own frame — the decoupled
+    per-camera-per-wall architecture). Tracking then never merges or matches
+    observations across cameras, since inter-frame distances are meaningless.
+    """
 
     mode: str = "highest_confidence"
     merge_radius: float = 0.35
     track_max_age: float = 0.5
+    cross_camera: bool = True
 
 
 @dataclass
@@ -230,6 +237,18 @@ class RoomConfig:
             raise ValueError("fusion.merge_radius must be > 0")
         if self.fusion.track_max_age <= 0:
             raise ValueError("fusion.track_max_age must be > 0")
+        if not self.fusion.cross_camera:
+            # Unregistered per-camera frames: a wall's plane lives in exactly
+            # one camera's frame, so a second server for the same wall would
+            # intersect rays with a plane from an alien frame — garbage.
+            for wall_id in wall_ids:
+                servers = [cid for cid, cam in self.cameras.items()
+                           if wall_id in cam.serves]
+                if len(servers) > 1:
+                    raise ValueError(
+                        f"fusion.cross_camera is false (unregistered frames) "
+                        f"but wall {wall_id!r} is served by {servers}; each "
+                        f"wall must have exactly one serving camera")
         if self.server.ws_port <= 0 or self.server.http_port <= 0:
             raise ValueError("server ports must be positive")
         if self.server.fps <= 0:
@@ -554,6 +573,9 @@ def _parse_fusion(raw: object) -> FusionCfg:
     defaults = FusionCfg()
     mode = raw.get("mode", defaults.mode)
     _require(isinstance(mode, str), "fusion.mode must be a string")
+    cross_camera = raw.get("cross_camera", defaults.cross_camera)
+    _require(isinstance(cross_camera, bool),
+             "fusion.cross_camera must be a boolean")
     return FusionCfg(
         mode=mode,
         merge_radius=_as_number(
@@ -562,6 +584,7 @@ def _parse_fusion(raw: object) -> FusionCfg:
         track_max_age=_as_number(
             raw.get("track_max_age", defaults.track_max_age),
             "fusion.track_max_age"),
+        cross_camera=cross_camera,
     )
 
 

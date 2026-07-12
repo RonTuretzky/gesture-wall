@@ -178,10 +178,15 @@ def persons_to_room_obs(persons_by_camera: dict[str, list[Person]],
     stray worker should not crash the fuser).
     """
     obs: list[RoomObs] = []
+    cross = config.fusion.cross_camera
     for camera_id, persons in persons_by_camera.items():
         if camera_id not in config.cameras:
             continue
         room_hom = config.room_homography(camera_id)
+        # Decoupled rooms (cross_camera=False): each camera's coordinates live
+        # in its OWN unregistered frame, so name the frame after the camera and
+        # the tracker will never compare positions across cameras.
+        frame_id = "room" if cross else camera_id
         for person in persons:
             depth_room_xy = getattr(person, "room_xy", None)
             if depth_room_xy is not None:
@@ -192,7 +197,7 @@ def persons_to_room_obs(persons_by_camera: dict[str, list[Person]],
                 room_xy = (room_hom.apply(ax, ay)
                            if room_hom is not None else (ax, ay))
             obs.append(RoomObs(camera_id=camera_id, person=person,
-                               room_xy=room_xy))
+                               room_xy=room_xy, frame_id=frame_id))
     return obs
 
 
@@ -337,6 +342,13 @@ def make_pose_source(config: RoomConfig, camera_id: str):
     from .multipose import MultiPoseSource  # lazy: pulls in cv2/mediapipe
 
     cam = config.cameras[camera_id]
+    if cam.kind == "kinect_v2":
+        # A Kinect camera on the 2D webcam path means the config is not depth-
+        # complete (usually serves=[] before calibration) — cv2.VideoCapture
+        # would treat the serial as a filename and fail with no cursors ever.
+        print(f"[gesturewall] WARNING: camera {camera_id!r} is kinect_v2 but "
+              f"the room resolved to homography mode — run the calibration "
+              f"(or fix 'serves') so depth mode engages")
     return MultiPoseSource(
         camera=cam.device,
         num_poses=srv.num_poses,
@@ -560,7 +572,11 @@ class GestureServer:
         # cadence would flicker healthy detections in and out.
         fresh = min(self.config.fusion.track_max_age,
                     max(2.5 / max(1, self.config.server.fps), 0.2))
-        persons = self.store.snapshot(now, fresh)
+        # Snapshot with the RAW clock: workers stamp entries with time.monotonic()
+        # directly, while ``now`` above is server-relative (monotonic - start).
+        # Mixing epochs made ``now - t`` hugely negative, so staleness never
+        # fired and a dead camera's last Persons ghosted forever.
+        persons = self.store.snapshot(self._clock(), fresh)
         cursors_by_wall = self.pipeline.step(persons, now)
 
         for wall, cursors in cursors_by_wall.items():
@@ -638,7 +654,7 @@ async def serve(config: RoomConfig, web_dir: str,
     print(f"[gesturewall] ws    listening on "
           f"ws://localhost:{config.server.ws_port}")
     print(f"[gesturewall] walls: {', '.join(config.walls)}  "
-          f"cameras: {', '.join(config.cameras)}")
+          f"cameras: {', '.join(config.cameras)}  mode: {config.mode}")
 
     try:
         async with ws_serve(server.handle_client, "", config.server.ws_port):

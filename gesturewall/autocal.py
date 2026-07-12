@@ -48,8 +48,8 @@ from .room import RoomConfig
 MARKER_GRID = [(u, v) for v in (0.15, 0.5, 0.85) for u in (0.12, 0.5, 0.88)]
 
 # Detection thresholds (tuned for a 512x424 registered color image).
-MIN_PEAK = 18.0        # min magenta-score delta at the blob peak, else "not seen"
-MIN_AREA_PX = 20       # min blob area in pixels
+MIN_PEAK = 11.0        # min magenta-score delta at the blob peak, else "not seen"
+MIN_AREA_PX = 16       # min blob area in pixels
 MAX_AREA_PX = 90000    # ~40% of frame: reject only a whole-scene flash, not a
                        # legitimately large disc seen close / very obliquely
 # A projected MAGENTA disc raises RED and BLUE by roughly equal amounts; a
@@ -347,7 +347,9 @@ class AutoCalibrator:
     """Drives the marker sequence and computes planes + extrinsics."""
 
     def __init__(self, config_path: str, walls, cameras: dict,
-                 cam_walls: dict | None = None):
+                 cam_walls: dict | None = None,
+                 wall_width: float | dict | None = None,
+                 decoupled: bool | None = None):
         # cameras: cam_id -> KinectV2Source-like with .read() -> (color, depth, intr)
         # cam_walls: cam_id -> set of wall ids that camera can actually SEE. A
         #   camera mounted right beside its own wall sees the OTHER wall only as
@@ -358,6 +360,36 @@ class AutoCalibrator:
         self.cam_walls = ({c: set(walls) for c in cameras}
                           if cam_walls is None else
                           {c: set(cam_walls.get(c, walls)) for c in cameras})
+        # Optional ground-truth physical wall widths (m). When the operator
+        # measures them, we pin each fitted plane's u_vec to the exact length so
+        # the horizontal mapping is correct even if the camera can't quite see
+        # the far edge (the near edge / origin is the well-seen anchor). A bare
+        # float (legacy single-wall form) applies to every calibrated wall.
+        if wall_width is None:
+            self.wall_widths: dict[str, float] = {}
+        elif isinstance(wall_width, dict):
+            self.wall_widths = {w: float(m) for w, m in wall_width.items()}
+        else:
+            self.wall_widths = {w: float(wall_width) for w in self.walls}
+        # DECOUPLED mode: every wall is owned by exactly ONE camera and no
+        # camera claims two walls — the physical reality when no camera can see
+        # both walls (70° FOV vs a 90° corner). Each wall's plane is then fit
+        # in its owner camera's OWN frame with an identity extrinsic; the two
+        # frames are never registered or compared. ``decoupled=True`` asserts
+        # the mode explicitly (--pair); ``None`` infers it from a disjoint
+        # multi-camera partition (e.g. a re-run over a decoupled config).
+        owners = {w: [c for c in self.cameras if w in self.cam_walls[c]]
+                  for w in self.walls}
+        partition = (all(len(cs) == 1 for cs in owners.values())
+                     and len({cs[0] for cs in owners.values()})
+                     == len(self.walls))
+        if decoupled and not partition:
+            raise ValueError("decoupled calibration needs a one-camera-per-"
+                             f"wall partition; got owners {owners}")
+        self.decoupled = (partition and len(self.cameras) > 1
+                          if decoupled is None else bool(decoupled))
+        self.wall_owner = ({w: cs[0] for w, cs in owners.items()}
+                           if self.decoupled else {})
         self.state = {"phase": "idle", "marker": None, "msg": "waiting"}
         self.status = {"progress": 0.0, "detections": {}, "report": []}
         self._lock = threading.Lock()
@@ -438,6 +470,16 @@ class AutoCalibrator:
             traceback.print_exc()
             self._set(phase="error", marker=None, msg=str(e))
             self._log(f"FAILED: {e}")
+        finally:
+            # Release the Kinects after every run, success or failure: a
+            # bridge that died mid-run can only recover via a fresh spawn
+            # (read() restarts a closed source), and holding the USB open
+            # after "done" would block the gesture server from starting.
+            for src in self.cameras.values():
+                try:
+                    src.close()
+                except Exception:  # noqa: BLE001 - best-effort release
+                    pass
 
     def _run_inner(self):
         self._set(phase="running", msg="warming up cameras")
@@ -461,12 +503,12 @@ class AutoCalibrator:
             for (u, v) in MARKER_GRID:
                 # OFF baseline
                 self._set(marker=None)
-                self._drain(0.6)
-                off = {c: self._capture(c, n_frames=3) for c in cam_ids}
-                # ON
+                self._drain(0.7)
+                off = {c: self._capture(c, n_frames=4) for c in cam_ids}
+                # ON — longer settle + more frames so a dim/distant dot is caught
                 self._set(marker={"wall": wall, "u": u, "v": v})
-                self._drain(0.9)
-                on = {c: self._capture(c, n_frames=4) for c in cam_ids}
+                self._drain(1.1)
+                on = {c: self._capture(c, n_frames=6) for c in cam_ids}
 
                 for c in cam_ids:
                     if off[c] is None or on[c] is None:
@@ -499,26 +541,29 @@ class AutoCalibrator:
         counts = {w: {c: len(samples[w][c]) for c in cam_ids} for w in self.walls}
         self._log(f"detections: {counts}")
 
-        # Reference camera = the one that sees the walls most SQUARELY, not the
-        # one with the most dots. A camera viewing a wall edge-on still detects
-        # its dots but collapses the plane to ~0 width; such a view must never
-        # anchor the room frame. Score each camera by how many walls it fits to
-        # a sane (non-degenerate) plane, tie-broken by total markers.
-        def _wallish(cam):
-            good = 0
-            for w in self.walls:
-                s = samples[w][cam]
-                if len(s) >= 4:
-                    pw, ph = plane_metrics(fit_wall_plane(s))
-                    if WIDTH_RANGE[0] <= pw <= WIDTH_RANGE[1] \
-                            and HEIGHT_RANGE[0] <= ph <= HEIGHT_RANGE[1]:
-                        good += 1
-            return good
+        if self.decoupled:
+            return self._solve_decoupled(samples, intrinsics)
+
+        # Reference camera = the one that sees the walls most SQUARELY, judged
+        # by the 3D SPREAD of its markers (robust to sample count). A camera
+        # viewing a wall edge-on still detects its dots but they collapse into a
+        # thin sliver (small span) — such a view must never anchor the room
+        # frame. Count walls a camera spans well (>= 1 m), tie-broken by markers.
+        def _span(pts):
+            if len(pts) < 3:
+                return 0.0
+            import numpy as np
+            P = np.asarray([p for (_u, _v, p) in pts], dtype=float)
+            return float(np.linalg.norm(P.max(axis=0) - P.min(axis=0)))
+        cam_spans = {c: {w: _span(samples[w][c]) for w in self.walls}
+                     for c in cam_ids}
+        def _walls_seen(c):
+            return sum(1 for w in self.walls if cam_spans[c][w] >= 1.0)
         ref_cam = max(cam_ids,
-                      key=lambda c: (_wallish(c),
-                                     sum(len(samples[w][c]) for w in self.walls)))
+                      key=lambda c: (_walls_seen(c),
+                                     sum(cam_spans[c].values())))
         self._log(f"reference camera (room frame): {ref_cam} "
-                  f"(sees {_wallish(ref_cam)} wall(s) squarely)")
+                  f"(spans: {', '.join(f'{w}={cam_spans[ref_cam][w]:.1f}m' for w in self.walls)})")
 
         # --- per-camera per-wall outlier rejection ------------------------- #
         # tol=0.10: reflections/persons sit MUCH further off-plane than this,
@@ -556,21 +601,21 @@ class AutoCalibrator:
             extrinsics[c] = ext
 
         def pooled_for(wall):
-            pool = list(samples[wall][ref_cam])
-            for c in second:
-                if c in extrinsics:
+            # Pool a camera's samples for a wall ONLY if that camera sees the
+            # wall WELL (>= 1 m of 3D spread). A registered camera that views a
+            # wall edge-on still detected its dots, but they collapse into a
+            # sliver whose transformed points would poison the plane — exactly
+            # what turned wall A into 0.02 m. The reference camera (identity
+            # extrinsic) is included on the same footing.
+            pool = []
+            for c in cam_ids:
+                if c in extrinsics and cam_spans[c][wall] >= 1.0:
                     pool.extend((u, v, extrinsics[c].apply(p))
                                 for (u, v, p) in samples[wall][c])
             return pool
 
         # --- save raw samples for offline debugging / refits ---------------- #
-        try:
-            dump = {w: {c: [[u, v, list(p)] for (u, v, p) in samples[w][c]]
-                        for c in cam_ids} for w in self.walls}
-            Path("autocal_samples.json").write_text(json.dumps(dump, indent=1))
-            self._log("raw samples saved to autocal_samples.json")
-        except Exception:  # noqa: BLE001 - debugging aid only
-            pass
+        self._dump_samples(samples)
 
         # --- plane fits: anchor on the best-seen wall ---------------------- #
         # Free-fit every wall. A wall seen edge-on collapses to ~0 width, so we
@@ -602,6 +647,11 @@ class AutoCalibrator:
         aw, ah = plane_metrics(planes[anchor_wall])
         self._log(f"anchor wall {anchor_wall}: {len(pools[anchor_wall])} "
                   f"markers -> width {aw:.2f} m, height {ah:.2f} m")
+        # Pin the anchor's width NOW, before other walls are corner-constrained
+        # to its far-u seam corner — the constraint must use the measured
+        # width, not the fitted one. (The later _pin_widths call is a no-op
+        # for the anchor and pins the remaining walls after their fits.)
+        self._pin_widths(planes)
 
         for wall in self.walls:
             if wall == anchor_wall:
@@ -633,6 +683,8 @@ class AutoCalibrator:
             self._log(f"wall {wall}: corner-constrained to {anchor_wall} at 90° "
                       f"-> width {w:.2f} m, height {h:.2f} m")
 
+        self._pin_widths(planes)
+
         # --- sanity gates --------------------------------------------------- #
         problems = []
         for wall, plane in planes.items():
@@ -652,24 +704,156 @@ class AutoCalibrator:
 
         # --- write the config ------------------------------------------------ #
         cfg = load_config_dict(self.config_path)
+        full_run = set(cfg.get("walls", {})) <= set(self.walls)
         for wall, plane in planes.items():
             cfg = merge_wall_plane(cfg, wall, plane)
         for c in cam_ids:
             if c in extrinsics and c in intrinsics:
                 cfg = merge_camera_pose(cfg, c, intrinsics[c], extrinsics[c],
                                         kind="kinect_v2")
-                # serve only the walls this camera actually PROVED it sees
-                # (>= 3 detected markers) and that got calibrated — a camera
-                # never drives a wall it sees only by reflection or edge-on.
+                # serve only the walls this camera sees WELL (>= 1 m of 3D
+                # marker spread) and that got calibrated — a camera never drives
+                # a wall it sees edge-on/by reflection, where its live pointing
+                # rays would be depth-noisy garbage.
                 cfg["cameras"][c]["serves"] = [
                     w for w in self.walls
-                    if w in self.cam_walls[c] and w in planes
-                    and len(samples[w][c]) >= 3]
-            elif c not in extrinsics:
-                cfg["cameras"][c]["serves"] = []  # unregistered: keep out
+                    if w in planes and cam_spans[c][w] >= 1.0]
+            elif c not in extrinsics and full_run:
+                # Unregistered camera in a FULL calibration: keep it out of
+                # fusion. A partial (--wall) run must NOT wipe a camera it
+                # wasn't asked about — its other-wall calibration stays intact.
+                cfg["cameras"][c]["serves"] = []
+        # Keep fusion.cross_camera consistent with what THIS run established:
+        # a full multi-camera registration proves one shared frame (safe to
+        # merge tracks across cameras again, e.g. after a decoupled config is
+        # jointly recalibrated); a single-camera run installs an identity
+        # frame, which is UNREGISTERED against any other serving camera.
+        registered_all = all(c in extrinsics for c in cam_ids)
+        others_serving = any(cam.get("serves")
+                             for cid, cam in cfg.get("cameras", {}).items()
+                             if cid not in cam_ids)
+        if len(cam_ids) > 1 and registered_all and not others_serving:
+            cfg.setdefault("fusion", {})["cross_camera"] = True
+        elif len(cam_ids) == 1 and others_serving:
+            cfg.setdefault("fusion", {})["cross_camera"] = False
+            self._log("frames unregistered across cameras -> "
+                      "fusion.cross_camera=false")
         RoomConfig.from_dict(cfg)  # validate before persisting
         save_config_dict(self.config_path, cfg)
         self._log(f"wrote {self.config_path}")
+        with self._lock:
+            self.status["progress"] = 1.0
+        self._set(phase="done", marker=None, msg="ok")
+
+    def _dump_samples(self, samples) -> None:
+        """Save raw samples for offline debugging / refits (best-effort)."""
+        try:
+            dump = {w: {c: [[u, v, list(p)] for (u, v, p) in samples[w][c]]
+                        for c in samples[w]} for w in self.walls}
+            Path("autocal_samples.json").write_text(json.dumps(dump, indent=1))
+            self._log("raw samples saved to autocal_samples.json")
+        except Exception:  # noqa: BLE001 - debugging aid only
+            pass
+
+    def _pin_widths(self, planes) -> None:
+        """Rescale each plane's u_vec to the operator-measured width (in place).
+
+        The camera nails a plane's orientation/position but may under-read its
+        width when it can't see the far edge. Pinning to the tape-measured
+        value, anchored at the well-seen origin edge, makes horizontal tile
+        selection dead-on. Walls without a measurement keep their fitted width.
+
+        A fit whose width is FAR from the measurement is refused rather than
+        rescued: when the fitted width collapses (grazing view, clustered
+        detections) the u direction itself is noise-dominated, and pinning it
+        would launder exactly the degenerate fits the sanity gates exist to
+        block. Idempotent: re-pinning an already-pinned plane is a no-op.
+        """
+        import dataclasses
+        for wall in list(planes):
+            target = self.wall_widths.get(wall)
+            if target is None:
+                continue
+            p = planes[wall]
+            cur = math.sqrt(sum(c * c for c in p.u_vec))
+            if cur <= 1e-6:
+                continue
+            if abs(cur - target) / target > 0.30:
+                raise RuntimeError(
+                    f"wall {wall}: fitted width {cur:.2f} m is >30% off the "
+                    f"measured {target:.2f} m — bad aim/lighting, refusing to "
+                    f"pin (re-aim the camera and re-run)")
+            s = target / cur
+            planes[wall] = dataclasses.replace(
+                p, u_vec=tuple(c * s for c in p.u_vec))
+            self._log(f"wall {wall}: pinned width {cur:.2f} m -> "
+                      f"{target:.2f} m (operator measurement)")
+
+    def _solve_decoupled(self, samples, intrinsics) -> None:
+        """Per-wall solve for the decoupled architecture: one camera per wall,
+        each wall's plane fit in its OWNER camera's own frame, identity
+        extrinsics, no cross-camera registration.
+
+        Every cross-frame step of the joint solve (reference-camera pick,
+        Kabsch registration, sample pooling, corner-constrained fits, the
+        inter-wall angle/seam gates) is skipped — each presumes one shared
+        frame, and with two unregistered frames even a PERFECT calibration
+        would misfire them (both squarely-faced walls have normal ~ -Z in
+        their own frames, so the apparent inter-plane angle is ~0°, not 90°).
+        """
+        self._log("DECOUPLED solve: " + ", ".join(
+            f"{w}<-{c}" for w, c in sorted(self.wall_owner.items())))
+        # Dump BEFORE fitting: failed runs are the ones that need debugging.
+        self._dump_samples(samples)
+
+        planes = {}
+        for wall in self.walls:
+            owner = self.wall_owner[wall]
+            kept, dropped = reject_off_plane(samples[wall][owner], tol=0.10)
+            if dropped:
+                self._log(f"wall {wall} {owner}: dropped {dropped} off-plane "
+                          f"(reflection/person) sample(s)")
+            if len(kept) < 4:
+                raise RuntimeError(
+                    f"wall {wall}: only {len(kept)} usable markers from "
+                    f"{owner} — is its autocal page fullscreen on that "
+                    f"projector and facing the camera?")
+            planes[wall] = fit_wall_plane(kept)
+            w, h = plane_metrics(planes[wall])
+            self._log(f"wall {wall}: {len(kept)} markers ({owner}'s frame) "
+                      f"-> width {w:.2f} m, height {h:.2f} m")
+
+        self._pin_widths(planes)
+
+        # Frame-local sanity only — no inter-wall angle/seam gates here.
+        problems = []
+        for wall, plane in planes.items():
+            w, h = plane_metrics(plane)
+            if not (WIDTH_RANGE[0] <= w <= WIDTH_RANGE[1]):
+                problems.append(f"wall {wall} width {w:.2f} m out of range")
+            if not (HEIGHT_RANGE[0] <= h <= HEIGHT_RANGE[1]):
+                problems.append(f"wall {wall} height {h:.2f} m out of range")
+        if problems:
+            raise RuntimeError("; ".join(problems))
+
+        cfg = load_config_dict(self.config_path)
+        for wall, plane in planes.items():
+            cfg = merge_wall_plane(cfg, wall, plane)
+        for c in self.cameras:
+            if c not in intrinsics:
+                continue
+            cfg = merge_camera_pose(cfg, c, intrinsics[c],
+                                    Extrinsic.identity(), kind="kinect_v2")
+            # Ownership is the operator's assertion (--pair), not inferred
+            # from marker spread: each camera serves exactly its own wall.
+            cfg["cameras"][c]["serves"] = sorted(self.cam_walls[c])
+        # Declare the frames unregistered so tracking never merges or matches
+        # observations across the two cameras (inter-frame distances are
+        # meaningless; see FusionCfg.cross_camera).
+        cfg.setdefault("fusion", {})["cross_camera"] = False
+        RoomConfig.from_dict(cfg)  # validate before persisting
+        save_config_dict(self.config_path, cfg)
+        self._log(f"wrote {self.config_path} (decoupled: per-camera frames)")
         with self._lock:
             self.status["progress"] = 1.0
         self._set(phase="done", marker=None, msg="ok")
@@ -733,22 +917,110 @@ def main(argv=None) -> int:
     ap.add_argument("--config", required=True)
     ap.add_argument("--port", type=int, default=8801)
     ap.add_argument("--web-dir", default=str(Path(__file__).parent.parent / "web"))
+    ap.add_argument("--wall", default=None,
+                    help="calibrate ONE wall only (e.g. A) — for a room where "
+                         "no single camera can see both walls; each camera owns "
+                         "the wall it can see, no cross-camera registration")
+    ap.add_argument("--camera", default=None,
+                    help="with --wall, use ONLY this camera (identity frame). "
+                         "It defines the room frame for the wall it serves.")
+    ap.add_argument("--pair", action="append", metavar="CAM=WALL",
+                    help="DECOUPLED mode, one flag per camera (e.g. "
+                         "--pair cam0=A --pair cam1=B): each camera owns "
+                         "exactly one wall in its OWN frame (identity "
+                         "extrinsic); both projector pages run in ONE pass, "
+                         "no cross-camera registration")
+    ap.add_argument("--width", action="append", metavar="[WALL=]METRES",
+                    help="ground-truth physical wall width: repeatable "
+                         "WALL=METRES (e.g. --width A=2.3 --width B=2.5), or "
+                         "a single bare METRES with --wall; pins the fitted "
+                         "plane's width to this exact value")
     args = ap.parse_args(argv)
 
     cfg = RoomConfig.from_dict(load_config_dict(args.config))
     from .kinect import KinectV2Source  # lazy: spawns bridges
 
-    cameras = {cam_id: KinectV2Source(device_index=cam.device)
-               for cam_id, cam in cfg.cameras.items()}
-    walls = list(cfg.walls)
-    # A camera's `serves` list doubles as "which walls it can SEE" — a camera
-    # beside its own wall serves only that wall, so its view of the other wall
-    # (reflections) is excluded from calibration. Empty serves = sees all.
-    cam_walls = {cid: (set(cam.serves) if cam.serves else set(walls))
-                 for cid, cam in cfg.cameras.items()}
-    for cid, ws in cam_walls.items():
-        print(f"[autocal] {cid} calibrates walls: {sorted(ws)}")
-    calib = AutoCalibrator(args.config, walls, cameras, cam_walls=cam_walls)
+    if args.pair and (args.wall or args.camera):
+        ap.error("--pair cannot be combined with --wall/--camera")
+
+    if args.pair:
+        # Decoupled mode: an explicit operator-asserted CAM=WALL partition.
+        pairs: dict[str, str] = {}
+        for spec in args.pair:
+            cam, sep, wall = spec.partition("=")
+            if not sep or not cam or not wall:
+                ap.error(f"--pair {spec!r}: expected CAM=WALL (e.g. cam0=A)")
+            if cam not in cfg.cameras:
+                ap.error(f"--pair {spec!r}: unknown camera {cam!r} "
+                         f"(config has {list(cfg.cameras)})")
+            if wall not in cfg.walls:
+                ap.error(f"--pair {spec!r}: unknown wall {wall!r} "
+                         f"(config has {list(cfg.walls)})")
+            if cam in pairs or wall in pairs.values():
+                ap.error(f"--pair {spec!r}: camera or wall given twice")
+            pairs[cam] = wall
+        cam_ids = list(pairs)
+        walls = [pairs[c] for c in cam_ids]
+        cam_walls = {c: {w} for c, w in pairs.items()}
+        print("[autocal] DECOUPLED mode: "
+              + ", ".join(f"{c}->{pairs[c]}" for c in cam_ids)
+              + " (identity frames, no cross-camera registration)")
+    elif args.wall or args.camera:
+        # Single-wall mode: restrict to one wall (+ optionally one camera) so
+        # only that wall's projector page and that camera matter — the config
+        # write only touches that wall/camera, leaving the other wall intact.
+        if args.camera and args.camera not in cfg.cameras:
+            ap.error(f"--camera {args.camera!r}: unknown camera "
+                     f"(config has {list(cfg.cameras)})")
+        if args.wall and args.wall not in cfg.walls:
+            ap.error(f"--wall {args.wall!r}: unknown wall "
+                     f"(config has {list(cfg.walls)})")
+        cam_ids = [args.camera] if args.camera else list(cfg.cameras)
+        walls = [args.wall] if args.wall else list(cfg.walls)
+        cam_walls = {cid: set(walls) for cid in cam_ids}
+        print(f"[autocal] SINGLE mode: wall(s) {walls} from camera(s) "
+              f"{cam_ids} (no cross-camera registration)")
+    else:
+        # Joint mode. A camera's `serves` doubles as "which walls it can SEE"
+        # (empty = sees all), so its edge-on view of the other wall is excluded.
+        # Note: after a decoupled run serves is [A]/[B], so a plain re-run
+        # auto-infers decoupled again inside AutoCalibrator — by design.
+        cam_ids = list(cfg.cameras)
+        walls = list(cfg.walls)
+        cam_walls = {cid: (set(cfg.cameras[cid].serves)
+                           if cfg.cameras[cid].serves else set(walls))
+                     for cid in cam_ids}
+        for cid, ws in cam_walls.items():
+            print(f"[autocal] {cid} calibrates walls: {sorted(ws)}")
+
+    widths: dict | float | None = None
+    if args.width:
+        try:
+            if all("=" in v for v in args.width):
+                widths = {}
+                for spec in args.width:
+                    wall, _, metres = spec.partition("=")
+                    if wall not in walls:
+                        ap.error(f"--width {spec!r}: wall {wall!r} is not in "
+                                 f"this run (walls: {walls})")
+                    if wall in widths:
+                        ap.error(f"--width {spec!r}: wall given twice")
+                    widths[wall] = float(metres)
+            elif len(args.width) == 1 and args.wall:
+                widths = float(args.width[0])
+            else:
+                ap.error("--width: use WALL=METRES (repeatable), or a single "
+                         "bare METRES together with --wall")
+        except ValueError:
+            ap.error(f"--width: {args.width!r} is not a number")
+        vals = widths.values() if isinstance(widths, dict) else [widths]
+        if any(v <= 0 for v in vals):
+            ap.error("--width: widths must be positive metres")
+
+    cameras = {cam_id: KinectV2Source(device_index=cfg.cameras[cam_id].device)
+               for cam_id in cam_ids}
+    calib = AutoCalibrator(args.config, walls, cameras, cam_walls=cam_walls,
+                           wall_width=widths, decoupled=bool(args.pair) or None)
 
     httpd = ThreadingHTTPServer(("", args.port),
                                 make_handler(args.web_dir, calib))

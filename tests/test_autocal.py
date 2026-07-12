@@ -273,3 +273,143 @@ def test_capture_stall_returns_none():
     calib._lock = __import__("threading").Lock()
     got = calib._capture("cam0", n_frames=2, deadline_s=0.2)
     assert got is None
+
+
+# --------------------------------------------------------------------------- #
+# decoupled mode (one camera per wall, per-camera frames)                      #
+# --------------------------------------------------------------------------- #
+def test_decoupled_inference():
+    cams = {"cam0": FakeSource([]), "cam1": FakeSource([])}
+    # Disjoint one-camera-per-wall partition -> decoupled.
+    c = AutoCalibrator("x", ["A", "B"], cams,
+                       cam_walls={"cam0": ["A"], "cam1": ["B"]})
+    assert c.decoupled is True
+    assert c.wall_owner == {"A": "cam0", "B": "cam1"}
+    # Joint (both cameras see both walls) -> not decoupled.
+    j = AutoCalibrator("x", ["A", "B"], cams, cam_walls=None)
+    assert j.decoupled is False
+    # Single camera (single-wall mode) -> not decoupled.
+    s = AutoCalibrator("x", ["A"], {"cam0": FakeSource([])},
+                       cam_walls={"cam0": ["A"]})
+    assert s.decoupled is False
+
+
+def test_wall_widths_normalization():
+    cams = {"cam0": FakeSource([])}
+    assert AutoCalibrator("x", ["A"], cams).wall_widths == {}
+    assert AutoCalibrator("x", ["A", "B"], {"cam0": FakeSource([]),
+                                            "cam1": FakeSource([])},
+                          wall_width=2.3).wall_widths \
+        == {"A": 2.3, "B": 2.3}
+    assert AutoCalibrator("x", ["A", "B"], cams,
+                          wall_width={"A": 2.3, "B": 2.5}).wall_widths \
+        == {"A": 2.3, "B": 2.5}
+
+
+def _decoupled_calibrator(tmp_path, widths=None):
+    """An AutoCalibrator over a minimal 2-wall/2-camera temp config."""
+    import json as _json
+    cfg = {
+        "walls": {
+            "A": {"display": 1, "grid": {"rows": 2, "cols": 3}},
+            "B": {"display": 2, "grid": {"rows": 2, "cols": 3}},
+        },
+        "cameras": {
+            "cam0": {"device": "072843433747", "serves": []},
+            "cam1": {"device": "010289152747", "serves": []},
+        },
+    }
+    path = tmp_path / "room.json"
+    path.write_text(_json.dumps(cfg))
+    cams = {"cam0": FakeSource([]), "cam1": FakeSource([])}
+    return AutoCalibrator(str(path), ["A", "B"], cams,
+                          cam_walls={"cam0": ["A"], "cam1": ["B"]},
+                          wall_width=widths), path
+
+
+def test_solve_decoupled_writes_identity_frames(tmp_path, monkeypatch):
+    import json as _json
+
+    monkeypatch.chdir(tmp_path)  # autocal_samples.json dump lands here
+    calib, path = _decoupled_calibrator(tmp_path,
+                                        widths={"A": 2.3, "B": 2.5})
+    # Wall A flat in cam0's frame at z=2.0 (2.0 m wide, 1.4 m tall); wall B
+    # flat in cam1's frame at z=2.5 (2.4 m wide, 2.0 m tall). Coordinates are
+    # deliberately reused across frames — they must never be compared.
+    samples = {
+        "A": {"cam0": [(u, v, (u * 2.0 - 1.0, 0.7 - v * 1.4, 2.0))
+                       for (u, v) in MARKER_GRID],
+              "cam1": []},
+        "B": {"cam0": [],
+              "cam1": [(u, v, (u * 2.4 - 1.2, 1.0 - v * 2.0, 2.5))
+                       for (u, v) in MARKER_GRID]},
+    }
+    intr = {"cam0": INTR, "cam1": INTR}
+    calib._solve_decoupled(samples, intr)
+
+    out = _json.loads(path.read_text())
+    ident = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0],
+             [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]]
+    for cam, wall in (("cam0", "A"), ("cam1", "B")):
+        assert out["cameras"][cam]["serves"] == [wall]
+        assert out["cameras"][cam]["extrinsic"]["matrix"] == ident
+        assert out["cameras"][cam]["kind"] == "kinect_v2"
+    assert out["fusion"]["cross_camera"] is False
+
+    pa, pb = out["walls"]["A"]["plane"], out["walls"]["B"]["plane"]
+    wa = math.sqrt(sum(c * c for c in pa["u_vec"]))
+    wb = math.sqrt(sum(c * c for c in pb["u_vec"]))
+    assert wa == pytest.approx(2.3, abs=1e-6)   # operator pin, not the 2.0 fit
+    assert wb == pytest.approx(2.5, abs=1e-6)
+    ha = math.sqrt(sum(c * c for c in pa["v_vec"]))
+    assert ha == pytest.approx(1.4, abs=0.02)   # height keeps the fitted value
+    assert calib.get_state()["phase"] == "done"
+
+
+def test_solve_decoupled_too_few_markers_raises(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    calib, _ = _decoupled_calibrator(tmp_path)
+    samples = {
+        "A": {"cam0": [(u, v, (u * 2.0 - 1.0, 0.7 - v * 1.4, 2.0))
+                       for (u, v) in list(MARKER_GRID)[:3]],   # only 3
+              "cam1": []},
+        "B": {"cam0": [],
+              "cam1": [(u, v, (u * 2.4 - 1.2, 1.0 - v * 2.0, 2.5))
+                       for (u, v) in MARKER_GRID]},
+    }
+    with pytest.raises(RuntimeError, match="wall A.*usable markers"):
+        calib._solve_decoupled(samples, {"cam0": INTR, "cam1": INTR})
+
+
+def test_explicit_decoupled_single_pair():
+    # A lone --pair must take the decoupled path (not silently run joint).
+    c = AutoCalibrator("x", ["A"], {"cam0": FakeSource([])},
+                       cam_walls={"cam0": ["A"]}, decoupled=True)
+    assert c.decoupled is True
+    assert c.wall_owner == {"A": "cam0"}
+    # Forcing decoupled without a 1:1 partition is refused.
+    with pytest.raises(ValueError, match="partition"):
+        AutoCalibrator("x", ["A", "B"],
+                       {"cam0": FakeSource([]), "cam1": FakeSource([])},
+                       cam_walls={"cam0": ["A", "B"], "cam1": ["A", "B"]},
+                       decoupled=True)
+
+
+def test_pin_widths_refuses_degenerate_fit(tmp_path, monkeypatch):
+    # A collapsed 0.4 m fit must NOT be laundered to 2.5 m by the pin — the
+    # u direction of a degenerate fit is noise, so rescaling it would write a
+    # confidently wrong horizontal mapping.
+    monkeypatch.chdir(tmp_path)
+    calib, _ = _decoupled_calibrator(tmp_path, widths={"A": 2.3, "B": 2.5})
+    samples = {
+        "A": {"cam0": [(u, v, (u * 2.0 - 1.0, 0.7 - v * 1.4, 2.0))
+                       for (u, v) in MARKER_GRID],
+              "cam1": []},
+        "B": {"cam0": [],
+              "cam1": [(u, v, (u * 0.4 - 0.2, 1.0 - v * 2.0, 2.5))
+                       for (u, v) in MARKER_GRID]},   # 0.4 m sliver
+    }
+    with pytest.raises(RuntimeError, match="wall B.*refusing to pin"):
+        calib._solve_decoupled(samples, {"cam0": INTR, "cam1": INTR})
+    # The raw-sample dump still happened (failed runs need debugging most).
+    assert (tmp_path / "autocal_samples.json").exists()

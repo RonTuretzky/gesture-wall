@@ -466,3 +466,35 @@ def test_server_pointing_validation():
     base["server"]["pointing"] = "nope"
     with pytest.raises(ValueError):
         RoomConfig.from_dict(base)                                   # invalid
+
+
+# --------------------------------------------------------------------------- #
+# fusion.cross_camera (decoupled per-camera frames)                            #
+# --------------------------------------------------------------------------- #
+def test_fusion_cross_camera_defaults_true(example_dict):
+    cfg = RoomConfig.from_dict(example_dict)
+    assert cfg.fusion.cross_camera is True
+
+
+def test_fusion_cross_camera_false_parses(example_dict):
+    # Unregistered frames demand one serving camera per wall.
+    example_dict["cameras"]["cam0"]["serves"] = ["A"]
+    example_dict["cameras"]["cam1"]["serves"] = []
+    example_dict["cameras"]["cam2"]["serves"] = ["B"]
+    example_dict["fusion"]["cross_camera"] = False
+    cfg = RoomConfig.from_dict(example_dict)
+    assert cfg.fusion.cross_camera is False
+
+
+def test_fusion_cross_camera_rejects_non_bool(example_dict):
+    example_dict["fusion"]["cross_camera"] = "no"
+    with pytest.raises(ValueError, match="cross_camera"):
+        RoomConfig.from_dict(example_dict)
+
+
+def test_cross_camera_false_rejects_multi_served_wall(example_dict):
+    # room.example.json has wall A served by cam0 AND cam1 — fine with one
+    # registered frame, meaningless with unregistered per-camera frames.
+    example_dict["fusion"]["cross_camera"] = False
+    with pytest.raises(ValueError, match="exactly one serving camera"):
+        RoomConfig.from_dict(example_dict)

@@ -49,7 +49,9 @@ const err  = document.getElementById("err");
 // angles, small enough to localize (the detector uses its centroid).
 function showDot(u, v) {
   const W = innerWidth, H = innerHeight;
-  const r = Math.max(28, Math.min(W, H) * 0.075);
+  // Bigger disc = detectable from a far/oblique diagonal camera (still small
+  // enough that its centroid localizes the wall point well).
+  const r = Math.max(46, Math.min(W, H) * 0.11);
   dot.style.width = dot.style.height = (2 * r) + "px";
   dot.style.left = (u * W - r) + "px";
   dot.style.top  = (v * H - r) + "px";
