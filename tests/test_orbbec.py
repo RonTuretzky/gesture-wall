@@ -150,10 +150,20 @@ class FakeStreamProfile:
 
 
 class FakeStreamProfileList:
+    """Offers BGR + RGB color profiles by default (like the real G335, whose
+    frame processor enumerates converted profiles from the native MJPG)."""
+
+    offered_formats: set[str] | None = None  # None = any format accepted
+
     def __init__(self, sensor_type):
         self.sensor_type = sensor_type
 
     def get_video_stream_profile(self, width, height, fmt, fps):
+        name = getattr(fmt, "name", str(fmt))
+        if (self.offered_formats is not None
+                and name not in self.offered_formats
+                and name != "UNKNOWN_FORMAT"):
+            raise FakeOBError(f"no {name} profile")
         return FakeStreamProfile("video", (width, height, fmt, fps))
 
     def get_default_video_stream_profile(self):
@@ -236,7 +246,9 @@ def build_stub(devices, frameset_factory, error_on_open=None):
     mod.AlignFilter = FakeAlignFilter
     mod.OBSensorType = types.SimpleNamespace(
         COLOR_SENSOR=_Enum("COLOR_SENSOR"), DEPTH_SENSOR=_Enum("DEPTH_SENSOR"))
-    mod.OBFormat = types.SimpleNamespace(RGB=_Enum("RGB"))
+    mod.OBFormat = types.SimpleNamespace(
+        RGB=_Enum("RGB"), BGR=_Enum("BGR"),
+        UNKNOWN_FORMAT=_Enum("UNKNOWN_FORMAT"))
     mod.OBStreamType = types.SimpleNamespace(
         COLOR_STREAM=_Enum("COLOR_STREAM"))
     mod.OBFrameAggregateOutputMode = types.SimpleNamespace(
@@ -306,6 +318,9 @@ def test_constructor_touches_no_sdk(monkeypatch):
 # --------------------------------------------------------------------------- #
 def test_read_returns_bgr_metres_and_intrinsics(monkeypatch):
     state = install_stub(monkeypatch)
+    # Offer only RGB so the BGR-preferred request falls back and the source
+    # must channel-flip (the native-BGR path is pinned separately below).
+    monkeypatch.setattr(FakeStreamProfileList, "offered_formats", {"RGB"})
     src = OrbbecSource(device_index=0)
     item = src.read(timeout=1.0)
     assert item is not None
@@ -489,17 +504,65 @@ def test_start_wires_profiles_aggregate_mode_and_color_tuning(monkeypatch):
     pipe = state["pipelines"][0]
     assert pipe.started
     cfg = pipe.config
-    # Color: exact 1280x720 RGB@30 profile; depth: the sensor default.
+    # Color: exact 1280x720 @30 profile, native BGR preferred (no host flip);
+    # depth: the sensor default.
     kinds = [(p.kind, p.args) for p in cfg.enabled]
     assert kinds[0][0] == "video"
     w, h, fmt, fps = kinds[0][1]
     assert (w, h, fps) == (1280, 720, 30)
-    assert fmt.name == "RGB"
+    assert fmt.name == "BGR"
+    assert src._color_is_bgr is True
     assert kinds[1][0] == "default"
     assert cfg.aggregate_mode.name == "FULL_FRAME_REQUIRE"
     # Align filter targets the color stream.
     assert src._align.align_to_stream.name == "COLOR_STREAM"
-    # Best-effort color lock: auto WB + auto exposure disabled on the device.
-    props = {pid.name: val for pid, val in pipe.device.bool_props}
-    assert props == {"AUTO_WB": False, "AUTO_EXPOSURE": False}
+    # Color pipeline stays on firmware AUTO exposure/WB: the Gemini's manual
+    # defaults are green-cast/badly exposed and kill magenta marker detection.
+    assert pipe.device.bool_props == []
+    src.close()
+
+
+def test_native_bgr_profile_skips_flip(monkeypatch):
+    # Default stub offers BGR: the wire bytes must come back UNFLIPPED
+    # (they are already BGR on the wire in this mode).
+    install_stub(monkeypatch)
+    src = OrbbecSource(device_index=0)
+    color, _, _ = src.read(timeout=1.0)
+    np.testing.assert_array_equal(color, sample_rgb())  # same bytes, no flip
+    src.close()
+
+
+def test_stall_exhaust_closes_for_respawn(monkeypatch):
+    # With timeout=None, ~20 empty wait slices must (a) return None and
+    # (b) CLOSE the pipeline so the next read() can respawn — without the
+    # close, the server path waits on a dead pipeline forever.
+    import gesturewall.orbbec as orbbec_mod
+
+    silent = {"on": False}
+    state = install_stub(
+        monkeypatch,
+        frameset_factory=lambda ms: None if silent["on"] else make_frameset())
+    monkeypatch.setattr(orbbec_mod, "_WAIT_SLICE_MS", 1)
+    monkeypatch.setattr(orbbec_mod, "_MAX_STALL_SLICES", 3)
+    src = OrbbecSource(device_index=0)
+    assert src.read(timeout=1.0) is not None      # healthy first
+    silent["on"] = True                           # device goes silent
+    assert src.read() is None                     # stall-exhaust
+    assert src._pipe is None                      # closed -> respawnable
+    assert state["pipelines"][0].stopped
+    silent["on"] = False                          # device back
+    assert src.read(timeout=1.0) is not None      # respawned transparently
+    assert len(state["pipelines"]) == 2
+    src.close()
+
+
+def test_explicit_depth_size_selects_profile(monkeypatch):
+    install_stub(monkeypatch)
+    src = OrbbecSource(device_index=0, depth_size=(1280, 800))
+    src.start()
+    depth_args = src._pipe.config.enabled[1]
+    assert depth_args.kind == "video"
+    w, h, fmt, fps = depth_args.args
+    assert (w, h, fps) == (1280, 800, 30)
+    assert fmt.name == "UNKNOWN_FORMAT"           # any native depth format
     src.close()

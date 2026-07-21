@@ -73,15 +73,24 @@ class OrbbecSource:
 
     def __init__(self, device_index: int | str = 0,
                  width: int = DEFAULT_WIDTH, height: int = DEFAULT_HEIGHT,
-                 fps: int = DEFAULT_FPS):
+                 fps: int = DEFAULT_FPS,
+                 depth_size: tuple[int, int] | None = None):
+        # depth_size: explicit native depth resolution, e.g. (1280, 800) for
+        # the G335's full IR resolution. None = the sensor's default profile
+        # (848x480 on the G335, upsampled to color by the align filter). The
+        # full-res mode puts ~1 native depth sample under each color pixel —
+        # more real measurements on a thin wrist — at higher USB bandwidth
+        # and possibly higher per-pixel noise; A/B before making it default.
         self._device_index = device_index
         self._width = width
         self._height = height
         self._fps = fps
+        self._depth_size = depth_size
         self._ctx = None            # keep the SDK Context alive with the device
         self._device = None
         self._pipe = None
         self._align = None
+        self._color_is_bgr = False  # set in start() from the chosen profile
         self._intrinsics: CameraIntrinsics | None = None
         self._warned_color_tuning = False
 
@@ -111,16 +120,29 @@ class OrbbecSource:
 
         device = self._open_device(Context, OBError)
         self._tune_color(device)
+        self._warn_if_usb2(device)
 
         pipe = Pipeline(device)
         cfg = Config()
-        color_profile = pipe.get_stream_profile_list(
-            OBSensorType.COLOR_SENSOR
-        ).get_video_stream_profile(
-            self._width, self._height, OBFormat.RGB, self._fps)
-        depth_profile = pipe.get_stream_profile_list(
-            OBSensorType.DEPTH_SENSOR
-        ).get_default_video_stream_profile()
+        colors = pipe.get_stream_profile_list(OBSensorType.COLOR_SENSOR)
+        # Prefer a native BGR profile (saves a full-frame channel flip per
+        # frame); the camera streams MJPG either way and the SDK's frame
+        # processor decodes host-side, so BGR vs RGB is free to request.
+        try:
+            color_profile = colors.get_video_stream_profile(
+                self._width, self._height, OBFormat.BGR, self._fps)
+            self._color_is_bgr = True
+        except OBError:
+            color_profile = colors.get_video_stream_profile(
+                self._width, self._height, OBFormat.RGB, self._fps)
+            self._color_is_bgr = False
+        depths = pipe.get_stream_profile_list(OBSensorType.DEPTH_SENSOR)
+        if self._depth_size is not None:
+            dw, dh = self._depth_size
+            depth_profile = depths.get_video_stream_profile(
+                dw, dh, OBFormat.UNKNOWN_FORMAT, self._fps)
+        else:
+            depth_profile = depths.get_default_video_stream_profile()
         cfg.enable_stream(color_profile)
         cfg.enable_stream(depth_profile)
         # Only emit framesets that contain BOTH streams; read() still guards
@@ -134,6 +156,20 @@ class OrbbecSource:
         self._device = device
         self._align = align
         self._pipe = pipe
+
+    def _warn_if_usb2(self, device) -> None:
+        """Warn once if the camera enumerated on USB 2 — the classic silent
+        failure mode (streams start, then starve). Best-effort: older
+        firmwares may not report a connection type."""
+        try:
+            info = device.get_device_info()
+            conn = str(info.get_connection_type())
+            if "2." in conn and "3" not in conn:
+                print(f"orbbec: WARNING - camera on {conn}, not USB 3; "
+                      "expect stream starvation (use a USB 3 port/cable)",
+                      file=sys.stderr)
+        except Exception:  # noqa: BLE001 - diagnostics only
+            pass
 
     def _open_device(self, Context, OBError):
         """Enumerate devices and pick by serial (str) or index (int).
@@ -197,25 +233,32 @@ class OrbbecSource:
                 "failure).") from exc
 
     def _tune_color(self, device) -> None:
-        """Best-effort: freeze auto white-balance and auto exposure.
+        """Keep the color pipeline on firmware auto-exposure / auto-WB.
 
-        Autocal's OFF/ON magenta diffing compares color frames captured
-        seconds apart, so a drifting auto-WB/auto-exposure pipeline shows up
-        as fake "projector" deltas; a locked color pipeline keeps the diff
-        clean. Firmware/SDK combos that reject these properties just get one
-        warning and we carry on with auto everything.
+        We tried locking AWB/exposure so autocal's OFF/ON magenta diffing
+        would see a perfectly stable pipeline — but the Gemini's MANUAL
+        defaults produce a green-cast, badly exposed image that guts the
+        red/blue channels the magenta detector needs (live result: 0-2 of 18
+        markers detected, all garbage). The autos re-converge quickly and the
+        capture flow already absorbs their drift (settle drains between
+        OFF/ON plus median-of-frames), so auto everything is the right call.
+        """
+
+    def _log_pipeline_status(self) -> None:
+        """Best-effort: say WHERE a stall sits (SDK/driver/firmware/hardware).
+
+        ``Pipeline.get_status()`` classifies the problem source, which tells
+        an operator whether to reseat USB (driver/hw) or power-cycle the
+        camera (firmware) instead of guessing.
         """
         try:
-            from pyorbbecsdk import OBPropertyID
-            device.set_bool_property(
-                OBPropertyID.OB_PROP_COLOR_AUTO_WHITE_BALANCE_BOOL, False)
-            device.set_bool_property(
-                OBPropertyID.OB_PROP_COLOR_AUTO_EXPOSURE_BOOL, False)
-        except Exception as exc:  # pragma: no cover - depends on firmware
-            if not self._warned_color_tuning:
-                self._warned_color_tuning = True
-                print(f"orbbec: could not disable auto WB/exposure ({exc}); "
-                      "autocal color diffs may be noisier", file=sys.stderr)
+            status = self._pipe.get_status()
+            print(f"orbbec: pipeline stalled - status issue={status.issue} "
+                  f"sdk={status.sdk_status} drv={status.drv_status} "
+                  f"dev={status.dev_status}", file=sys.stderr)
+        except Exception:  # noqa: BLE001 - diagnostics only
+            print("orbbec: pipeline stalled (no status available)",
+                  file=sys.stderr)
 
     def close(self) -> None:
         """Stop the pipeline and drop all SDK refs (idempotent, pre-start ok).
@@ -276,7 +319,14 @@ class OrbbecSource:
             if frames is None:
                 stalls += 1
                 if deadline is None and stalls >= _MAX_STALL_SLICES:
-                    return None  # ~20 s of silence: treat as end-of-stream
+                    # ~20 s of silence: treat as end-of-stream. CLOSE so the
+                    # next read() re-enumerates and respawns the pipeline —
+                    # without this the dead pipeline is waited on forever and
+                    # the camera never recovers (the server's no-timeout path
+                    # relies on exactly this contract).
+                    self._log_pipeline_status()
+                    self.close()
+                    return None
                 continue  # bounded wait: deadline check at loop top decides
             stalls = 0
             aligned = self._align.process(frames)
@@ -303,9 +353,12 @@ class OrbbecSource:
         float32 conversion.
         """
         cw, ch = int(color.get_width()), int(color.get_height())
-        rgb = np.frombuffer(
+        pix = np.frombuffer(
             color.get_data(), dtype=np.uint8).reshape(ch, cw, 3)
-        bgr = rgb[:, :, ::-1].copy()  # RGB -> BGR without needing cv2
+        if self._color_is_bgr:
+            bgr = pix.copy()          # native BGR profile: no channel flip
+        else:
+            bgr = pix[:, :, ::-1].copy()  # RGB -> BGR without needing cv2
 
         dw, dh = int(depth.get_width()), int(depth.get_height())
         raw = np.frombuffer(

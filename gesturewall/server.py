@@ -117,11 +117,19 @@ class RaySmoother:
     dropped. Pure: no cv2/asyncio.
     """
 
+    # Filter state survives a key going missing for this long. A single-frame
+    # wrist depth hole drops the Person for one tick; deleting the 1-Euro
+    # state instantly would make the returning cursor JUMP and re-converge —
+    # exactly the jitter this smoother exists to remove. Held state longer
+    # than a couple of ticks would instead bridge a genuine departure.
+    HOLD_S = 0.25
+
     def __init__(self, freq: float = 30.0, min_cutoff: float = 1.0,
                  beta: float = 0.4):
         self._params = (freq, min_cutoff, beta)
         self._origin: dict[tuple[int, str], _Vec3Smoother] = {}
         self._end: dict[tuple[int, str], _Vec3Smoother] = {}
+        self._last_seen: dict[tuple[int, str], float] = {}
 
     def apply(self, tracks: list[Track], t: float) -> list[Track]:
         live: set[tuple[int, str]] = set()
@@ -151,9 +159,14 @@ class RaySmoother:
                 new_person = replace(m.person, ray=new_ray)
                 new_members.append(replace(m, person=new_person))
             out.append(replace(tr, members=new_members))
-        for key in [k for k in self._origin if k not in live]:
+        for key in live:
+            self._last_seen[key] = t
+        # Evict only after HOLD_S of absence, not on the first missed tick.
+        for key in [k for k, seen in self._last_seen.items()
+                    if k not in live and t - seen > self.HOLD_S]:
             del self._origin[key]
             del self._end[key]
+            del self._last_seen[key]
         return out
 
 

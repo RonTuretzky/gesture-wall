@@ -645,8 +645,13 @@ def test_ray_smoother_passthrough_converge_evict():
     assert rl.origin == pytest.approx((0.0, 0.0, 0.0), abs=1e-3)
     assert rl.origin[2] + rl.direction[2] == pytest.approx(3.0, abs=1e-3)  # endpoint held
 
-    sm.apply([], t=1.0)
-    assert not sm._origin and not sm._end                      # stale id evicted
+    # A short hole (< HOLD_S) must NOT evict: a single-frame wrist depth
+    # dropout would otherwise reset the 1-Euro state and make the returning
+    # cursor jump. Only sustained absence evicts.
+    sm.apply([], t=1.0)                    # 0.2 s since last seen: held
+    assert sm._origin and sm._end
+    sm.apply([], t=1.1)                    # 0.3 s > HOLD_S: evicted
+    assert not sm._origin and not sm._end and not sm._last_seen
 
 
 # --------------------------------------------------------------------------- #
