@@ -105,16 +105,38 @@ class FakeDeviceInfo:
         return self._serial
 
 
+class FakePresetList:
+    def __init__(self, names):
+        self._names = list(names)
+
+    def get_count(self):
+        return len(self._names)
+
+    def get_name_by_index(self, i):
+        return self._names[i]
+
+
 class FakeDevice:
-    def __init__(self, serial: str):
+    def __init__(self, serial: str, presets=("Default", "Hand")):
         self._info = FakeDeviceInfo(serial)
         self.bool_props: list[tuple[object, bool]] = []
+        self._presets = FakePresetList(presets)
+        self.current_preset = "Default"
 
     def get_device_info(self):
         return self._info
 
     def set_bool_property(self, prop_id, value):
         self.bool_props.append((prop_id, value))
+
+    def get_available_preset_list(self):
+        return self._presets
+
+    def get_current_preset_name(self):
+        return self.current_preset
+
+    def load_preset(self, name):
+        self.current_preset = name
 
 
 class FakeDeviceList:
@@ -204,7 +226,11 @@ class FakePipeline:
         self.started = False
         self.stopped = False
         self.config = None
+        self.frame_sync = False
         state["pipelines"].append(self)
+
+    def enable_frame_sync(self):
+        self.frame_sync = True
 
     def get_stream_profile_list(self, sensor_type):
         return FakeStreamProfileList(sensor_type)
@@ -565,4 +591,29 @@ def test_explicit_depth_size_selects_profile(monkeypatch):
     w, h, fmt, fps = depth_args.args
     assert (w, h, fps) == (1280, 800, 30)
     assert fmt.name == "UNKNOWN_FORMAT"           # any native depth format
+    src.close()
+
+
+def test_hand_preset_and_frame_sync_on_start(monkeypatch):
+    # "Hand" is Orbbec's named gesture preset; it must load BEFORE streaming
+    # (presets may never switch mid-stream). Frame sync pairs color+depth by
+    # hardware timestamp so a moving wrist reads depth from ITS color frame.
+    state = install_stub(monkeypatch)
+    src = OrbbecSource(device_index=0)
+    src.start()
+    pipe = state["pipelines"][0]
+    assert pipe.device.current_preset == "Hand"
+    assert pipe.frame_sync is True
+    assert pipe.started
+    src.close()
+
+
+def test_missing_preset_support_falls_back(monkeypatch):
+    # Firmware without "Hand" (or without presets at all) stays on default.
+    state = install_stub(
+        monkeypatch,
+        devices=[FakeDevice("CP0E8530002Y", presets=("Default",))])
+    src = OrbbecSource(device_index=0)
+    src.start()
+    assert state["pipelines"][0].device.current_preset == "Default"
     src.close()

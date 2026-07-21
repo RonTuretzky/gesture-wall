@@ -49,6 +49,10 @@ DEFAULT_WIDTH = 1280
 DEFAULT_HEIGHT = 720
 DEFAULT_FPS = 30
 
+# Depth preset loaded before streaming. "Hand" is Orbbec's named G330 preset
+# for gesture recognition; see _load_preset.
+PRESET = "Hand"
+
 # With ``read(timeout=None)`` we still bound each native wait to this slice so
 # a stalled pipeline can never hang the caller inside a single SDK call.
 _WAIT_SLICE_MS = 1000
@@ -57,8 +61,9 @@ _WAIT_SLICE_MS = 1000
 # end-of-stream and read() returns None — the Kinect source signals a dead
 # bridge the same way, and the no-timeout callers (the live server, calibrate)
 # rely on None to recover instead of blocking forever. A healthy pipeline
-# delivers at 30 fps, so 20 s of nothing means the device is gone.
-_MAX_STALL_SLICES = 20
+# delivers at 30 fps, so even 5 s of nothing means the device is gone; a
+# false trigger just costs one transparent re-enumeration.
+_MAX_STALL_SLICES = 5
 
 
 class OrbbecSource:
@@ -121,8 +126,18 @@ class OrbbecSource:
         device = self._open_device(Context, OBError)
         self._tune_color(device)
         self._warn_if_usb2(device)
+        self._load_preset(device)
 
         pipe = Pipeline(device)
+        # Pair color+depth by hardware timestamp. Without this the depth in a
+        # frameset can be up to ~33 ms stale relative to the color frame the
+        # pose landmarks come from — a wrist moving 1 m/s is then ~3 cm wrong
+        # in 3D, ~5x that at the wall. Officially composed with
+        # FULL_FRAME_REQUIRE + AlignFilter on the G330 series.
+        try:
+            pipe.enable_frame_sync()
+        except Exception as exc:  # noqa: BLE001 - firmware-dependent
+            print(f"orbbec: frame sync unavailable ({exc})", file=sys.stderr)
         cfg = Config()
         colors = pipe.get_stream_profile_list(OBSensorType.COLOR_SENSOR)
         # Prefer a native BGR profile (saves a full-frame channel flip per
@@ -156,6 +171,28 @@ class OrbbecSource:
         self._device = device
         self._align = align
         self._pipe = pipe
+
+    def _load_preset(self, device) -> None:
+        """Best-effort: load the "Hand" depth preset before streaming.
+
+        "Hand" is Orbbec's named G330 preset for gesture recognition ("clear
+        hand and finger edges") — exactly this pipeline's workload. Presets
+        may only be switched BEFORE the depth/IR streams start ("must be
+        avoided under any conditions" while streaming), which is why this
+        runs in start() before the pipeline exists. Firmwares without preset
+        support (or without "Hand") just stay on their default.
+        """
+        try:
+            plist = device.get_available_preset_list()
+            names = [plist.get_name_by_index(i)
+                     for i in range(plist.get_count())]
+            if PRESET in names and device.get_current_preset_name() != PRESET:
+                device.load_preset(PRESET)
+                print(f"orbbec: loaded depth preset {PRESET!r}",
+                      file=sys.stderr)
+        except Exception as exc:  # noqa: BLE001 - depends on firmware
+            print(f"orbbec: depth presets unavailable ({exc}); "
+                  "using device default", file=sys.stderr)
 
     def _warn_if_usb2(self, device) -> None:
         """Warn once if the camera enumerated on USB 2 — the classic silent
