@@ -11,3 +11,4 @@ room.json
 room.2cam.json
 # Compiled Kinect bridge (build from native/ via build_kinect_v2.sh).
 bin/
+Log/

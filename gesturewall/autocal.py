@@ -47,17 +47,22 @@ from .room import RoomConfig
 # stays fully on screen (and away from projector edge blending).
 MARKER_GRID = [(u, v) for v in (0.15, 0.5, 0.85) for u in (0.12, 0.5, 0.88)]
 
-# Detection thresholds (tuned for a 512x424 registered color image).
+# Detection thresholds. Tuned on a 512x424 registered color image, but the
+# area gates are FRAME FRACTIONS so the same disc still passes at higher
+# resolutions (at the Gemini 335's 1280x720 it covers ~3.8x the pixels).
 MIN_PEAK = 11.0        # min magenta-score delta at the blob peak, else "not seen"
-MIN_AREA_PX = 16       # min blob area in pixels
-MAX_AREA_PX = 90000    # ~40% of frame: reject only a whole-scene flash, not a
-                       # legitimately large disc seen close / very obliquely
+MIN_AREA_FRAC = 16 / (512 * 424)     # min blob area as a frame fraction
+                                     # (exactly the old 16 px at 512x424)
+MAX_AREA_FRAC = 90000 / (512 * 424)  # ~41% of frame: reject only a whole-scene
+                                     # flash, not a legitimately large disc seen
+                                     # close/obliquely (old 90000 px at 512x424)
 # A projected MAGENTA disc raises RED and BLUE by roughly equal amounts; a
 # person (skin/clothing) raises red (and green) but little blue. Requiring the
 # blue rise to be a real fraction of the red rise is what rejects people —
 # robustly, and without an area/shape gate that also kills big oblique discs.
 MAGENTA_BLUE_RATIO = 0.5
-DEPTH_WINDOW = 9       # sample_depth window around the blob centroid
+DEPTH_WINDOW_BASE = 9  # sample_depth window at 512 px frame width; scaled by
+                       # W/512 so the window covers the same wall patch
 
 # Sanity gates before we write anything into the config.
 WIDTH_RANGE = (1.0, 4.5)     # metres
@@ -80,6 +85,13 @@ def detect_marker(off_bgr, on_bgr):
     import cv2
     import numpy as np
 
+    # Resolution-relative gates and kernel: tuned at 512x424, scaled here from
+    # the actual frame so the same physical disc passes at e.g. 1280x720.
+    frame_h, frame_w = off_bgr.shape[:2]
+    min_area = MIN_AREA_FRAC * frame_h * frame_w
+    max_area = MAX_AREA_FRAC * frame_h * frame_w
+    k = max(3, int(round(9 * frame_w / 512)) | 1)  # odd blur kernel, 9 @ 512
+
     off = off_bgr.astype(np.int16)
     on = on_bgr.astype(np.int16)
     d_b = np.clip(on[:, :, 0] - off[:, :, 0], 0, 255)
@@ -87,7 +99,7 @@ def detect_marker(off_bgr, on_bgr):
     d_r = np.clip(on[:, :, 2] - off[:, :, 2], 0, 255)
     score = np.clip(d_r.astype(np.float32) + d_b.astype(np.float32)
                     - d_g.astype(np.float32), 0, None)
-    score = cv2.GaussianBlur(score, (9, 9), 0)
+    score = cv2.GaussianBlur(score, (k, k), 0)
 
     peak = float(score.max())
     if peak < MIN_PEAK:
@@ -105,13 +117,13 @@ def detect_marker(off_bgr, on_bgr):
     disc = max(contours, key=lambda c: cv2.pointPolygonTest(c, peak_pt, True))
     area = cv2.contourArea(disc)
     # Size gate: too small = noise/oblique sliver; too big = a whole-scene flash.
-    if not (MIN_AREA_PX <= area <= MAX_AREA_PX):
+    if not (min_area <= area <= max_area):
         return None
     # Ambiguity gate: a SECOND blob nearly as bright as the peak means two
     # markers/objects changed at once (spill, two dots) — refuse rather than
     # guess which is the real one.
     for c in contours:
-        if c is disc or cv2.contourArea(c) < MIN_AREA_PX:
+        if c is disc or cv2.contourArea(c) < min_area:
             continue
         m2 = np.zeros(mask.shape, np.uint8)
         cv2.drawContours(m2, [c], -1, 1, thickness=cv2.FILLED)
@@ -143,7 +155,10 @@ def marker_point3(px, py, depth_frames, intr: CameraIntrinsics):
     """Median-of-frames 3D point (CAMERA frame) at a detected blob centroid."""
     depths = []
     for dm in depth_frames:
-        d = sample_depth(dm, px, py, window=DEPTH_WINDOW)
+        # Resolution-relative window (odd, 9 @ 512 px wide) so the sampled
+        # wall patch stays the same physical size at 1280x720.
+        window = max(3, int(round(DEPTH_WINDOW_BASE * len(dm[0]) / 512)) | 1)
+        d = sample_depth(dm, px, py, window=window)
         if d is not None and 0.4 < d < 8.0:
             depths.append(d)
     if not depths:
@@ -338,6 +353,51 @@ def reject_off_plane(samples, tol=0.05):
         kept.pop(worst)
         dropped += 1
     return kept, dropped
+
+
+def _depth_kind_of(cfg: dict, cam_id: str) -> str:
+    """The kind to stamp on a depth pose write: never the webcam \"rgb\".
+
+    Pre-kind Kinect configs omit kind (or carry the parsed \"rgb\" default);
+    a depth calibration through this module always captured via a depth
+    source, so normalize to \"kinect_v2\" exactly like the capture fallback.
+    """
+    kind = cfg["cameras"][cam_id].get("kind", "kinect_v2")
+    return "kinect_v2" if kind == "rgb" else kind
+
+
+def _cross_camera_update(cfg, cam_ids, extrinsics, walls_served):
+    """New ``fusion.cross_camera`` value implied by THIS run, or ``None``.
+
+    ``cam_ids``/``extrinsics``/``walls_served`` describe the run just solved
+    (``walls_served``: cam_id -> walls it now serves); ``cfg`` is the config
+    about to be written. Three cases change the flag:
+
+      * a full multi-camera registration (every run camera got an extrinsic,
+        no bystander camera serving) proves ONE shared frame -> ``True``;
+      * a single-camera run beside OTHER serving cameras installed an
+        identity frame UNREGISTERED against theirs -> ``False``;
+      * a single-camera run whose camera serves EVERY configured wall while
+        no other camera serves anything -> ``True``: one camera IS one
+        registered frame, and this clears the stale ``False`` a decoupled-era
+        config leaves behind.
+
+    Anything else (partial runs) leaves the setting untouched (``None``).
+    """
+    registered_all = all(c in extrinsics for c in cam_ids)
+    others_serving = any(cam.get("serves")
+                         for cid, cam in cfg.get("cameras", {}).items()
+                         if cid not in cam_ids)
+    if len(cam_ids) > 1 and registered_all and not others_serving:
+        return True
+    if len(cam_ids) == 1 and others_serving:
+        return False
+    all_walls = set(cfg.get("walls", {}))
+    if (len(cam_ids) == 1 and registered_all and not others_serving
+            and all_walls
+            and all_walls <= set(walls_served.get(cam_ids[0], ()))):
+        return True
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -634,7 +694,9 @@ class AutoCalibrator:
                                  plane_point(pb, eb, 0.5))
                        for ea in (0.0, 1.0) for eb in (0.0, 1.0))
 
-        pools = {w: reject_off_plane(pooled_for(w))[0] for w in self.walls}
+        # tol=0.10 as in the per-camera pass: oblique seam-end noise is ~5 cm.
+        pools = {w: reject_off_plane(pooled_for(w), tol=0.10)[0]
+                 for w in self.walls}
         free = {w: fit_wall_plane(pools[w])
                 for w in self.walls if len(pools[w]) >= 4}
         sane = {w: p for w, p in free.items() if _sane(p)}
@@ -709,8 +771,11 @@ class AutoCalibrator:
             cfg = merge_wall_plane(cfg, wall, plane)
         for c in cam_ids:
             if c in extrinsics and c in intrinsics:
-                cfg = merge_camera_pose(cfg, c, intrinsics[c], extrinsics[c],
-                                        kind="kinect_v2")
+                # Preserve the configured sensor kind (kinect_v2/gemini_335):
+                # autocal fixes poses, it never changes what the camera IS.
+                cfg = merge_camera_pose(
+                    cfg, c, intrinsics[c], extrinsics[c],
+                    kind=_depth_kind_of(cfg, c))
                 # serve only the walls this camera sees WELL (>= 1 m of 3D
                 # marker spread) and that got calibrated — a camera never drives
                 # a wall it sees edge-on/by reflection, where its live pointing
@@ -723,21 +788,20 @@ class AutoCalibrator:
                 # fusion. A partial (--wall) run must NOT wipe a camera it
                 # wasn't asked about — its other-wall calibration stays intact.
                 cfg["cameras"][c]["serves"] = []
-        # Keep fusion.cross_camera consistent with what THIS run established:
-        # a full multi-camera registration proves one shared frame (safe to
-        # merge tracks across cameras again, e.g. after a decoupled config is
-        # jointly recalibrated); a single-camera run installs an identity
-        # frame, which is UNREGISTERED against any other serving camera.
-        registered_all = all(c in extrinsics for c in cam_ids)
-        others_serving = any(cam.get("serves")
-                             for cid, cam in cfg.get("cameras", {}).items()
-                             if cid not in cam_ids)
-        if len(cam_ids) > 1 and registered_all and not others_serving:
-            cfg.setdefault("fusion", {})["cross_camera"] = True
-        elif len(cam_ids) == 1 and others_serving:
+        # Keep fusion.cross_camera consistent with what THIS run established
+        # (the three cases are spelled out on _cross_camera_update).
+        walls_served = {c: cfg["cameras"][c].get("serves", [])
+                        for c in cam_ids if c in cfg.get("cameras", {})}
+        cc = _cross_camera_update(cfg, cam_ids, extrinsics, walls_served)
+        if cc is False:
             cfg.setdefault("fusion", {})["cross_camera"] = False
             self._log("frames unregistered across cameras -> "
                       "fusion.cross_camera=false")
+        elif cc is True:
+            cfg.setdefault("fusion", {})["cross_camera"] = True
+            if len(cam_ids) == 1:
+                self._log("one camera serves every wall (one registered "
+                          "frame) -> fusion.cross_camera=true")
         RoomConfig.from_dict(cfg)  # validate before persisting
         save_config_dict(self.config_path, cfg)
         self._log(f"wrote {self.config_path}")
@@ -842,8 +906,10 @@ class AutoCalibrator:
         for c in self.cameras:
             if c not in intrinsics:
                 continue
-            cfg = merge_camera_pose(cfg, c, intrinsics[c],
-                                    Extrinsic.identity(), kind="kinect_v2")
+            # Preserve the configured sensor kind (kinect_v2/gemini_335).
+            cfg = merge_camera_pose(
+                cfg, c, intrinsics[c], Extrinsic.identity(),
+                kind=_depth_kind_of(cfg, c))
             # Ownership is the operator's assertion (--pair), not inferred
             # from marker spread: each camera serves exactly its own wall.
             cfg["cameras"][c]["serves"] = sorted(self.cam_walls[c])
@@ -938,7 +1004,7 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
 
     cfg = RoomConfig.from_dict(load_config_dict(args.config))
-    from .kinect import KinectV2Source  # lazy: spawns bridges
+    from .framesource import make_frame_source  # lazy: may spawn bridges/SDKs
 
     if args.pair and (args.wall or args.camera):
         ap.error("--pair cannot be combined with --wall/--camera")
@@ -1017,8 +1083,13 @@ def main(argv=None) -> int:
         if any(v <= 0 for v in vals):
             ap.error("--width: widths must be positive metres")
 
-    cameras = {cam_id: KinectV2Source(device_index=cfg.cameras[cam_id].device)
-               for cam_id in cam_ids}
+    # Pre-kind Kinect configs parse as the "rgb" default; autocal historically
+    # always built a Kinect source, so keep that as the fallback.
+    def _src(cam_id):
+        kind = cfg.cameras[cam_id].kind
+        return make_frame_source("kinect_v2" if kind == "rgb" else kind,
+                                 cfg.cameras[cam_id].device)
+    cameras = {cam_id: _src(cam_id) for cam_id in cam_ids}
     calib = AutoCalibrator(args.config, walls, cameras, cam_walls=cam_walls,
                            wall_width=widths, decoupled=bool(args.pair) or None)
 

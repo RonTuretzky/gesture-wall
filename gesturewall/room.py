@@ -33,6 +33,11 @@ a depth-ray that is invariant to where a person stands. Walls may carry a 3D
 these fields are **optional** and default to ``None`` so existing
 homography-mode configs (and ``room.example.json``) stay valid unchanged.
 
+Depth cameras declare a ``kind`` from :data:`DEPTH_KINDS` — ``"kinect_v2"``
+(Kinect v2 via the libfreenect2 bridge) or ``"gemini_335"``/``"orbbec"``
+(an Orbbec Gemini 335); plain webcams are ``"rgb"`` (the default). The kind
+picks the frame source via :func:`gesturewall.framesource.make_frame_source`.
+
 The :attr:`RoomConfig.mode` property is ``"depth"`` iff *every* camera that
 serves a wall has both intrinsics and an extrinsic **and** every served wall has
 a plane; otherwise it is ``"homography"``. In depth mode :meth:`serves` no
@@ -51,6 +56,12 @@ from .calibration import Homography
 from .geometry import CameraIntrinsics, Extrinsic, WallPlane
 
 Matrix = list[list[float]]
+
+# Camera kinds that produce pixel-aligned color+depth frames (the 3D-ray
+# path); anything else is the plain 2D webcam path ("rgb"). Frame sources for
+# these kinds are built by gesturewall.framesource.make_frame_source, so a new
+# depth camera means: add its kind here and teach that one factory about it.
+DEPTH_KINDS = {"kinect_v2", "gemini_335", "orbbec"}
 
 
 # --------------------------------------------------------------------------- #
@@ -74,12 +85,14 @@ class WallCfg:
 class CameraCfg:
     """One camera: capture device, the walls it serves, optional room map.
 
-    Depth-mode cameras additionally carry ``kind`` (``"rgb"`` | ``"kinect_v2"``),
-    pinhole ``intrinsics`` and a CAMERA->ROOM ``extrinsic``. All default so
-    homography-mode cameras are unchanged.
+    Depth-mode cameras additionally carry ``kind`` (one of :data:`DEPTH_KINDS`;
+    plain webcams are ``"rgb"``), pinhole ``intrinsics`` and a CAMERA->ROOM
+    ``extrinsic``. All default so homography-mode cameras are unchanged.
     """
 
-    device: int | str  # int = enumeration index; str = a stable 12-digit serial
+    # int = enumeration index; str = a stable serial (Kinect v2: 12 digits,
+    # e.g. "072843433747"; Orbbec: alphanumeric, e.g. "CP0E8530002Y").
+    device: int | str
     serves: list[str]
     room_homography: Matrix | None = None
     kind: str = "rgb"
@@ -516,7 +529,7 @@ def _parse_cameras(raw: object) -> dict[str, CameraCfg]:
         if isinstance(raw_device, str):
             _require(len(raw_device) > 0,
                      f"camera {cam_id!r} device serial must be a non-empty string")
-            device = raw_device  # stable Kinect serial (index-independent)
+            device = raw_device  # stable device serial (index-independent)
         else:
             device = _as_int(raw_device, f"camera {cam_id!r} device")
         serves = craw.get("serves", [])
@@ -529,6 +542,10 @@ def _parse_cameras(raw: object) -> dict[str, CameraCfg]:
         kind = craw.get("kind", "rgb")
         _require(isinstance(kind, str),
                  f"camera {cam_id!r} \"kind\" must be a string")
+        _require(kind in {"rgb"} | DEPTH_KINDS,
+                 f"camera {cam_id!r} kind {kind!r} is not supported: use "
+                 f"\"rgb\" (2D webcam) or one of {sorted(DEPTH_KINDS)} "
+                 f"(depth cameras)")
         intrinsics = _parse_intrinsics(
             craw.get("intrinsics"), f"camera {cam_id!r} intrinsics")
         extrinsic = _parse_extrinsic(

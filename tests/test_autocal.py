@@ -10,16 +10,19 @@ import numpy as np
 import pytest
 
 from gesturewall.autocal import (MARKER_GRID, AutoCalibrator,
-                                 constrained_corner_fit, detect_marker,
-                                 lateral_spread, marker_point3, median_frame,
-                                 out_of_plane_spread, plane_angle_deg,
-                                 plane_metrics, plane_point, reject_off_plane,
-                                 robust_register)
+                                 _cross_camera_update, constrained_corner_fit,
+                                 detect_marker, lateral_spread, marker_point3,
+                                 median_frame, out_of_plane_spread,
+                                 plane_angle_deg, plane_metrics, plane_point,
+                                 reject_off_plane, robust_register)
 from gesturewall.geometry import (CameraIntrinsics, Extrinsic, fit_wall_plane,
                                   rigid_transform_from_points)
 
 INTR = CameraIntrinsics(fx=366.0, fy=366.0, cx=256.0, cy=212.0,
                         width=512, height=424)
+# A Gemini 335-shaped color/depth frame (1280x720) for resolution parity.
+INTR720 = CameraIntrinsics(fx=915.0, fy=915.0, cx=640.0, cy=360.0,
+                           width=1280, height=720)
 
 
 def scene(disc_at=None, radius=14, noise_seed=7):
@@ -29,6 +32,18 @@ def scene(disc_at=None, radius=14, noise_seed=7):
     img[100:200, 60:180] = (200, 210, 205)      # a bright "window"
     if disc_at is not None:
         yy, xx = np.mgrid[0:424, 0:512]
+        m = (xx - disc_at[0]) ** 2 + (yy - disc_at[1]) ** 2 <= radius ** 2
+        img[m] = (255, 40, 255)                  # magenta in BGR
+    return img
+
+
+def scene720(disc_at=None, radius=35, noise_seed=7):
+    """The scene() fixture rendered at 1280x720 (disc radius x2.5)."""
+    rng = np.random.default_rng(noise_seed)
+    img = rng.integers(30, 90, size=(720, 1280, 3), dtype=np.uint8)
+    img[170:340, 150:450] = (200, 210, 205)      # a bright "window"
+    if disc_at is not None:
+        yy, xx = np.mgrid[0:720, 0:1280]
         m = (xx - disc_at[0]) ** 2 + (yy - disc_at[1]) ** 2 <= radius ** 2
         img[m] = (255, 40, 255)                  # magenta in BGR
     return img
@@ -83,6 +98,52 @@ def test_detect_marker_rejects_two_comparable_blobs():
     m = (xx - 120) ** 2 + (yy - 300) ** 2 <= 14 ** 2  # a second equal disc
     on[m] = (255, 40, 255)
     assert detect_marker(off, on) is None
+
+
+# --------------------------------------------------------------------------- #
+# resolution parity: same scenes at 1280x720 (Gemini 335 color)                #
+# --------------------------------------------------------------------------- #
+def test_detect_marker_finds_disc_center_720p():
+    off = scene720()
+    on = scene720(disc_at=(750, 250))
+    det = detect_marker(off, on)
+    assert det is not None
+    px, py, peak = det
+    assert abs(px - 750) < 4 and abs(py - 250) < 4
+    assert peak > 100
+
+
+def test_detect_marker_accepts_large_oblique_disc_720p():
+    # The wall-B bloom case scaled x2.5: ~178k px of disc — far beyond the
+    # old fixed MAX_AREA_PX (90000) yet well under MAX_AREA_FRAC of a 720p
+    # frame. The fixed gate would reject every big oblique disc at 720p.
+    off = scene720()
+    on = scene720(disc_at=(640, 360), radius=238)
+    det = detect_marker(off, on)
+    assert det is not None
+    px, py, _ = det
+    assert abs(px - 640) < 12 and abs(py - 360) < 12
+
+
+def test_detect_marker_rejects_person_sized_blob_720p():
+    # Same skin-colored change as the 512x424 case, scaled to 720p: the area
+    # gate alone would PASS it, the magenta-balance gate must still reject.
+    off = scene720()
+    on = scene720()
+    on[100:610, 300:900] = (55, 150, 210)  # BGR skin-ish; not magenta
+    assert detect_marker(off, on) is None
+
+
+def test_detect_marker_none_when_no_change_720p():
+    assert detect_marker(scene720(), scene720()) is None
+
+
+def test_marker_point3_median_depth_720p():
+    depth = np.full((720, 1280), 2.5, dtype=np.float32)
+    bad = np.zeros((720, 1280), dtype=np.float32)  # all-invalid frame
+    p = marker_point3(750.0, 250.0, [depth, bad, depth], INTR720)
+    assert p is not None
+    assert abs(p[2] - 2.5) < 1e-6
 
 
 def test_lateral_spread_collinear_vs_2d():
@@ -276,6 +337,61 @@ def test_capture_stall_returns_none():
 
 
 # --------------------------------------------------------------------------- #
+# fusion.cross_camera truth maintenance                                        #
+# --------------------------------------------------------------------------- #
+def _cc_cfg(serves, cross_camera=None):
+    cfg = {"walls": {"A": {}, "B": {}},
+           "cameras": {c: {"serves": list(s)} for c, s in serves.items()}}
+    if cross_camera is not None:
+        cfg["fusion"] = {"cross_camera": cross_camera}
+    return cfg
+
+
+def test_cross_camera_single_cam_all_walls_true():
+    # ONE camera serving BOTH walls, no bystander serving: one camera is one
+    # registered frame — must clear a stale decoupled-era False.
+    cfg = _cc_cfg({"cam0": ["A", "B"], "cam1": []}, cross_camera=False)
+    got = _cross_camera_update(cfg, ["cam0"], {"cam0": Extrinsic.identity()},
+                               {"cam0": ["A", "B"]})
+    assert got is True
+
+
+def test_cross_camera_single_cam_partial_walls_untouched():
+    # A --wall run serving only A must not touch the flag (None).
+    cfg = _cc_cfg({"cam0": ["A"], "cam1": []})
+    got = _cross_camera_update(cfg, ["cam0"], {"cam0": Extrinsic.identity()},
+                               {"cam0": ["A"]})
+    assert got is None
+
+
+def test_cross_camera_single_cam_beside_serving_other_false():
+    # A single-camera run next to ANOTHER serving camera: identity frame,
+    # unregistered against the other's -> False.
+    cfg = _cc_cfg({"cam0": ["A"], "cam1": ["B"]})
+    got = _cross_camera_update(cfg, ["cam0"], {"cam0": Extrinsic.identity()},
+                               {"cam0": ["A"]})
+    assert got is False
+
+
+def test_cross_camera_joint_registered_true():
+    cfg = _cc_cfg({"cam0": ["A", "B"], "cam1": ["A", "B"]})
+    ident = Extrinsic.identity()
+    got = _cross_camera_update(cfg, ["cam0", "cam1"],
+                               {"cam0": ident, "cam1": ident},
+                               {"cam0": ["A", "B"], "cam1": ["A", "B"]})
+    assert got is True
+
+
+def test_cross_camera_joint_unregistered_camera_untouched():
+    # A camera that failed registration keeps the flag as-is (None).
+    cfg = _cc_cfg({"cam0": ["A", "B"], "cam1": []})
+    got = _cross_camera_update(cfg, ["cam0", "cam1"],
+                               {"cam0": Extrinsic.identity()},
+                               {"cam0": ["A", "B"]})
+    assert got is None
+
+
+# --------------------------------------------------------------------------- #
 # decoupled mode (one camera per wall, per-camera frames)                      #
 # --------------------------------------------------------------------------- #
 def test_decoupled_inference():
@@ -364,6 +480,31 @@ def test_solve_decoupled_writes_identity_frames(tmp_path, monkeypatch):
     ha = math.sqrt(sum(c * c for c in pa["v_vec"]))
     assert ha == pytest.approx(1.4, abs=0.02)   # height keeps the fitted value
     assert calib.get_state()["phase"] == "done"
+
+
+def test_solve_decoupled_preserves_configured_kind(tmp_path, monkeypatch):
+    # Autocal fixes poses; it must never rewrite what a camera IS. A config
+    # already declaring cam0 as a Gemini 335 keeps that kind, while a camera
+    # with no kind still gets the kinect_v2 default.
+    import json as _json
+
+    monkeypatch.chdir(tmp_path)
+    calib, path = _decoupled_calibrator(tmp_path)
+    cfg = _json.loads(path.read_text())
+    cfg["cameras"]["cam0"]["kind"] = "gemini_335"
+    path.write_text(_json.dumps(cfg))
+    samples = {
+        "A": {"cam0": [(u, v, (u * 2.0 - 1.0, 0.7 - v * 1.4, 2.0))
+                       for (u, v) in MARKER_GRID],
+              "cam1": []},
+        "B": {"cam0": [],
+              "cam1": [(u, v, (u * 2.4 - 1.2, 1.0 - v * 2.0, 2.5))
+                       for (u, v) in MARKER_GRID]},
+    }
+    calib._solve_decoupled(samples, {"cam0": INTR, "cam1": INTR})
+    out = _json.loads(path.read_text())
+    assert out["cameras"]["cam0"]["kind"] == "gemini_335"
+    assert out["cameras"]["cam1"]["kind"] == "kinect_v2"
 
 
 def test_solve_decoupled_too_few_markers_raises(tmp_path, monkeypatch):

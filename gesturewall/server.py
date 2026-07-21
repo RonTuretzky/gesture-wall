@@ -47,7 +47,7 @@ from .filters import OneEuroFilter, Point2DFilter
 from .fusion import Cursor, FusionEngine
 from .geometry import Ray
 from .multipose import Person
-from .room import RoomConfig
+from .room import DEPTH_KINDS, RoomConfig
 from .tracking import RoomObs, Track, Tracker
 
 
@@ -315,8 +315,10 @@ class FakeSource:
 def make_pose_source(config: RoomConfig, camera_id: str):
     """Construct the real pose source for a configured camera (mode-aware).
 
-    In depth mode each camera is a Kinect v2 lifted into the room frame, so we
-    build a :class:`~gesturewall.depth.KinectPoseSource` (color+depth -> 3D-ray
+    In depth mode each camera is a depth sensor (Kinect v2, Orbbec Gemini 335)
+    lifted into the room frame: its ``kind`` picks the frame source via
+    :func:`~gesturewall.framesource.make_frame_source`, wrapped in a
+    :class:`~gesturewall.depth.KinectPoseSource` (color+depth -> 3D-ray
     Persons) using the camera's extrinsic from the config. In homography mode we
     build the 2D :class:`~gesturewall.multipose.MultiPoseSource`. Either way the
     heavy cv2/mediapipe import happens lazily inside the source's ``__init__``,
@@ -325,10 +327,15 @@ def make_pose_source(config: RoomConfig, camera_id: str):
     """
     srv = config.server
     if config.mode == "depth":
-        from .depth import KinectPoseSource  # lazy: pulls in cv2/mediapipe
-        from .kinect import KinectV2Source    # lazy: spawns the bridge
+        from .depth import KinectPoseSource       # lazy: pulls in cv2/mediapipe
+        from .framesource import make_frame_source  # lazy: picks the sensor
 
-        frame_source = KinectV2Source(device_index=config.cameras[camera_id].device)
+        cam = config.cameras[camera_id]
+        # Pre-kind Kinect configs parse kind as the "rgb" default; the depth
+        # path historically always built a Kinect source, so keep that fallback
+        # (autocal/calibrate do the same).
+        kind = "kinect_v2" if cam.kind == "rgb" else cam.kind
+        frame_source = make_frame_source(kind, cam.device)
         return KinectPoseSource(
             frame_source=frame_source,
             extrinsic=config.extrinsic(camera_id),
@@ -342,13 +349,13 @@ def make_pose_source(config: RoomConfig, camera_id: str):
     from .multipose import MultiPoseSource  # lazy: pulls in cv2/mediapipe
 
     cam = config.cameras[camera_id]
-    if cam.kind == "kinect_v2":
-        # A Kinect camera on the 2D webcam path means the config is not depth-
+    if cam.kind in DEPTH_KINDS:
+        # A depth camera on the 2D webcam path means the config is not depth-
         # complete (usually serves=[] before calibration) — cv2.VideoCapture
         # would treat the serial as a filename and fail with no cursors ever.
-        print(f"[gesturewall] WARNING: camera {camera_id!r} is kinect_v2 but "
-              f"the room resolved to homography mode — run the calibration "
-              f"(or fix 'serves') so depth mode engages")
+        print(f"[gesturewall] WARNING: camera {camera_id!r} is a depth camera "
+              f"({cam.kind}) but the room resolved to homography mode — run "
+              f"the calibration (or fix 'serves') so depth mode engages")
     return MultiPoseSource(
         camera=cam.device,
         num_poses=srv.num_poses,
