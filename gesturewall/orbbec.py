@@ -416,7 +416,7 @@ class OrbbecSource:
             if frames is None:
                 stalls += 1
                 if deadline is None and stalls >= _MAX_STALL_SLICES:
-                    # ~20 s of silence: treat as end-of-stream. CLOSE so the
+                    # stall budget exhausted: treat as end-of-stream. CLOSE so the
                     # next read() re-enumerates and respawns the pipeline —
                     # without this the dead pipeline is waited on forever and
                     # the camera never recovers (the server's no-timeout path
