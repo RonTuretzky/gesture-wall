@@ -594,18 +594,46 @@ def test_explicit_depth_size_selects_profile(monkeypatch):
     src.close()
 
 
-def test_hand_preset_and_frame_sync_on_start(monkeypatch):
-    # "Hand" is Orbbec's named gesture preset; it must load BEFORE streaming
-    # (presets may never switch mid-stream). Frame sync pairs color+depth by
-    # hardware timestamp so a moving wrist reads depth from ITS color frame.
+def test_experimental_knobs_default_off(monkeypatch):
+    # Live A/B: the "recommended" trio (Hand preset + 1280x800 + frame sync)
+    # made pointing WORSE enabled together, so the defaults are the device's
+    # own behavior — no preset load, no frame sync, default depth profile.
     state = install_stub(monkeypatch)
     src = OrbbecSource(device_index=0)
     src.start()
     pipe = state["pipelines"][0]
-    assert pipe.device.current_preset == "Hand"
-    assert pipe.frame_sync is True
+    assert pipe.device.current_preset == "Default"   # untouched
+    assert pipe.frame_sync is False
+    assert pipe.config.enabled[1].kind == "default"  # sensor-default depth
     assert pipe.started
     src.close()
+
+
+def test_experimental_knobs_opt_in_via_env(monkeypatch):
+    # GESTUREWALL_ORBBEC_PRESET / _SYNC / _DEPTH re-enable each knob alone.
+    import importlib
+
+    import gesturewall.orbbec as orbbec_mod
+
+    monkeypatch.setenv("GESTUREWALL_ORBBEC_PRESET", "Hand")
+    monkeypatch.setenv("GESTUREWALL_ORBBEC_SYNC", "1")
+    monkeypatch.setenv("GESTUREWALL_ORBBEC_DEPTH", "1280x800")
+    importlib.reload(orbbec_mod)  # PRESET/FRAME_SYNC bind at import
+    try:
+        state = install_stub(monkeypatch)
+        src = orbbec_mod.OrbbecSource(device_index=0)
+        src.start()
+        pipe = state["pipelines"][0]
+        assert pipe.device.current_preset == "Hand"
+        assert pipe.frame_sync is True
+        w, h, fmt, fps = pipe.config.enabled[1].args
+        assert (w, h) == (1280, 800)
+        src.close()
+    finally:
+        monkeypatch.delenv("GESTUREWALL_ORBBEC_PRESET")
+        monkeypatch.delenv("GESTUREWALL_ORBBEC_SYNC")
+        monkeypatch.delenv("GESTUREWALL_ORBBEC_DEPTH")
+        importlib.reload(orbbec_mod)
 
 
 def test_missing_preset_support_falls_back(monkeypatch):

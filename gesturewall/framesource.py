@@ -46,11 +46,11 @@ def make_frame_source(kind: str, device):
     if kind in ("gemini_335", "orbbec"):
         from .orbbec import OrbbecSource  # lazy: SDK imports on start()
 
-        # 1280x800 is Orbbec's official recommended depth mode for the G335
-        # ("the key to obtaining a good depth performance") — full native IR
-        # resolution, ~1 real depth sample per aligned color pixel instead of
-        # upsampled 848x480. USB 3 only; the source warns if on USB 2.
-        return OrbbecSource(device_index=device, depth_size=(1280, 800))
+        # Device-default depth mode. Orbbec's "recommended" 1280x800 (plus the
+        # Hand preset and frame sync) measurably WORSENED pointing on the live
+        # rig when enabled together, so the experiment knobs live behind env
+        # vars in gesturewall.orbbec — see GESTUREWALL_ORBBEC_* there.
+        return OrbbecSource(device_index=device)
     raise ValueError(
         f"no depth frame source for camera kind {kind!r}: expected one of "
         f"'kinect_v2', 'gemini_335', 'orbbec' (kind 'rgb' is the 2D webcam "

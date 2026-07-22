@@ -37,6 +37,7 @@ Probe CLI (verifies the hardware end-to-end)::
 
 from __future__ import annotations
 
+import os
 import sys
 
 import numpy as np
@@ -49,9 +50,29 @@ DEFAULT_WIDTH = 1280
 DEFAULT_HEIGHT = 720
 DEFAULT_FPS = 30
 
-# Depth preset loaded before streaming. "Hand" is Orbbec's named G330 preset
-# for gesture recognition; see _load_preset.
-PRESET = "Hand"
+# ---- experimental knobs (opt-in via env; defaults = device behavior) ------- #
+# Live A/B on this room: Orbbec's "recommended" trio (Hand preset + 1280x800
+# depth + frame sync), enabled together, made pointing WORSE than the device
+# defaults (wall B marker fill dropped 9/9 -> 7/9; the Hand preset trades fill
+# for edge sharpness — the wrong tradeoff at 2.5-3.6 m). Each knob is therefore
+# opt-in until individually proven on this hardware:
+#   GESTUREWALL_ORBBEC_PRESET=Hand        depth preset (empty = device default)
+#   GESTUREWALL_ORBBEC_DEPTH=1280x800     explicit native depth mode
+#   GESTUREWALL_ORBBEC_SYNC=1             hardware color/depth frame sync
+PRESET = os.environ.get("GESTUREWALL_ORBBEC_PRESET", "")
+FRAME_SYNC = os.environ.get("GESTUREWALL_ORBBEC_SYNC", "") == "1"
+
+
+def _env_depth_size() -> tuple[int, int] | None:
+    raw = os.environ.get("GESTUREWALL_ORBBEC_DEPTH", "")
+    if raw and "x" in raw:
+        w, _, h = raw.partition("x")
+        try:
+            return (int(w), int(h))
+        except ValueError:
+            print(f"orbbec: bad GESTUREWALL_ORBBEC_DEPTH {raw!r}; using "
+                  "device default", file=sys.stderr)
+    return None
 
 # With ``read(timeout=None)`` we still bound each native wait to this slice so
 # a stalled pipeline can never hang the caller inside a single SDK call.
@@ -81,7 +102,8 @@ class OrbbecSource:
                  fps: int = DEFAULT_FPS,
                  depth_size: tuple[int, int] | None = None):
         # depth_size: explicit native depth resolution, e.g. (1280, 800) for
-        # the G335's full IR resolution. None = the sensor's default profile
+        # the G335's full IR resolution. None (the default) = the env knob
+        # GESTUREWALL_ORBBEC_DEPTH if set, else the sensor's default profile
         # (848x480 on the G335, upsampled to color by the align filter). The
         # full-res mode puts ~1 native depth sample under each color pixel —
         # more real measurements on a thin wrist — at higher USB bandwidth
@@ -90,7 +112,7 @@ class OrbbecSource:
         self._width = width
         self._height = height
         self._fps = fps
-        self._depth_size = depth_size
+        self._depth_size = depth_size or _env_depth_size()
         self._ctx = None            # keep the SDK Context alive with the device
         self._device = None
         self._pipe = None
@@ -129,15 +151,16 @@ class OrbbecSource:
         self._load_preset(device)
 
         pipe = Pipeline(device)
-        # Pair color+depth by hardware timestamp. Without this the depth in a
-        # frameset can be up to ~33 ms stale relative to the color frame the
-        # pose landmarks come from — a wrist moving 1 m/s is then ~3 cm wrong
-        # in 3D, ~5x that at the wall. Officially composed with
-        # FULL_FRAME_REQUIRE + AlignFilter on the G330 series.
-        try:
-            pipe.enable_frame_sync()
-        except Exception as exc:  # noqa: BLE001 - firmware-dependent
-            print(f"orbbec: frame sync unavailable ({exc})", file=sys.stderr)
+        # Optional (GESTUREWALL_ORBBEC_SYNC=1): pair color+depth by hardware
+        # timestamp so a moving wrist reads depth from ITS color frame. Kept
+        # opt-in: enabled together with the other "recommended" knobs it made
+        # pointing worse on this rig (see the knob comment at the top).
+        if FRAME_SYNC:
+            try:
+                pipe.enable_frame_sync()
+            except Exception as exc:  # noqa: BLE001 - firmware-dependent
+                print(f"orbbec: frame sync unavailable ({exc})",
+                      file=sys.stderr)
         cfg = Config()
         colors = pipe.get_stream_profile_list(OBSensorType.COLOR_SENSOR)
         # Prefer a native BGR profile (saves a full-frame channel flip per
@@ -182,6 +205,8 @@ class OrbbecSource:
         runs in start() before the pipeline exists. Firmwares without preset
         support (or without "Hand") just stay on their default.
         """
+        if not PRESET:
+            return  # default: leave the device on its own preset
         try:
             plist = device.get_available_preset_list()
             names = [plist.get_name_by_index(i)
@@ -190,6 +215,9 @@ class OrbbecSource:
                 device.load_preset(PRESET)
                 print(f"orbbec: loaded depth preset {PRESET!r}",
                       file=sys.stderr)
+            elif PRESET not in names:
+                print(f"orbbec: preset {PRESET!r} not offered by this "
+                      f"firmware (has: {names})", file=sys.stderr)
         except Exception as exc:  # noqa: BLE001 - depends on firmware
             print(f"orbbec: depth presets unavailable ({exc}); "
                   "using device default", file=sys.stderr)
@@ -270,16 +298,48 @@ class OrbbecSource:
                 "failure).") from exc
 
     def _tune_color(self, device) -> None:
-        """Keep the color pipeline on firmware auto-exposure / auto-WB.
+        """Color pipeline: firmware auto-exposure/auto-WB, optionally biased.
 
-        We tried locking AWB/exposure so autocal's OFF/ON magenta diffing
-        would see a perfectly stable pipeline — but the Gemini's MANUAL
-        defaults produce a green-cast, badly exposed image that guts the
-        red/blue channels the magenta detector needs (live result: 0-2 of 18
-        markers detected, all garbage). The autos re-converge quickly and the
-        capture flow already absorbs their drift (settle drains between
-        OFF/ON plus median-of-frames), so auto everything is the right call.
+        Full-manual was tried and reverted: the Gemini's MANUAL defaults
+        produce a green-cast, badly exposed image that guts the red/blue
+        channels autocal's magenta detector needs (live result: 0-2 of 18
+        markers, all garbage). Auto everything is the baseline.
+
+        The remaining problem is DARK rooms: depth doesn't care (the IR
+        stereo carries its own emitter) but MediaPipe pose runs on the COLOR
+        image, and a dark projected scene starves the landmarks — live
+        experiment: turning the room light on made pointing "much better".
+        The operational fix is keeping some ambient light on people. The
+        code-side levers (opt-in, applied WITHIN auto exposure so autocal's
+        diffing keeps working) bias the AE toward brighter people:
+
+          GESTUREWALL_ORBBEC_BRIGHTNESS=<int>  AE target brightness
+          GESTUREWALL_ORBBEC_BACKLIGHT=<0-6>   backlight compensation
+
+        Both are best-effort; unsupported firmwares just warn once. If a
+        value is changed, re-run autocal (color response changes).
         """
+        wanted = []
+        raw_b = os.environ.get("GESTUREWALL_ORBBEC_BRIGHTNESS", "")
+        raw_bl = os.environ.get("GESTUREWALL_ORBBEC_BACKLIGHT", "")
+        if raw_b.lstrip("-").isdigit():
+            wanted.append(("OB_PROP_COLOR_BRIGHTNESS_INT", int(raw_b)))
+        if raw_bl.isdigit():
+            wanted.append(("OB_PROP_COLOR_BACKLIGHT_COMPENSATION_INT",
+                           int(raw_bl)))
+        if not wanted:
+            return
+        try:
+            from pyorbbecsdk import OBPropertyID
+            for prop_name, value in wanted:
+                device.set_int_property(getattr(OBPropertyID, prop_name),
+                                        value)
+                print(f"orbbec: color {prop_name} = {value}", file=sys.stderr)
+        except Exception as exc:  # noqa: BLE001 - depends on firmware
+            if not self._warned_color_tuning:
+                self._warned_color_tuning = True
+                print(f"orbbec: color tuning unavailable ({exc}); "
+                      "staying on firmware defaults", file=sys.stderr)
 
     def _log_pipeline_status(self) -> None:
         """Best-effort: say WHERE a stall sits (SDK/driver/firmware/hardware).
