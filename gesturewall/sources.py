@@ -29,9 +29,16 @@ NOSE = 0
 LEFT_SHOULDER, RIGHT_SHOULDER = 11, 12
 LEFT_WRIST, RIGHT_WRIST = 15, 16
 
-POSE_MODEL_URL = ("https://storage.googleapis.com/mediapipe-models/"
-                  "pose_landmarker/pose_landmarker_lite/float16/latest/"
-                  "pose_landmarker_lite.task")
+_POSE_MODEL_URL_TMPL = ("https://storage.googleapis.com/mediapipe-models/"
+                        "pose_landmarker/{name}/float16/latest/{name}.task")
+# Known PoseLandmarker variants (increasing accuracy/stability, decreasing speed).
+# 'full' is the recommended balance; 'heavy' is the most landmark-stable.
+POSE_MODEL_URLS = {
+    "pose_landmarker_lite.task": _POSE_MODEL_URL_TMPL.format(name="pose_landmarker_lite"),
+    "pose_landmarker_full.task": _POSE_MODEL_URL_TMPL.format(name="pose_landmarker_full"),
+    "pose_landmarker_heavy.task": _POSE_MODEL_URL_TMPL.format(name="pose_landmarker_heavy"),
+}
+POSE_MODEL_URL = POSE_MODEL_URLS["pose_landmarker_lite.task"]  # back-compat default
 DEFAULT_MODEL_PATH = "models/pose_landmarker_lite.task"
 
 
@@ -69,17 +76,25 @@ class MouseSource(PointerSource):
 
 
 def ensure_pose_model(path: str = DEFAULT_MODEL_PATH,
-                      url: str = POSE_MODEL_URL) -> str:
+                      url: str | None = None) -> str:
     """Download the PoseLandmarker .task model on first use; return its path.
 
-    Downloads to a temporary ``.part`` file and atomically renames it into
-    place only on success. An interrupted download (Ctrl-C, dropped network,
-    sleep) therefore never leaves a truncated model that would be silently
-    cached and break every subsequent ``--source pose`` run.
+    When ``url`` is omitted it is inferred from the model's filename via
+    :data:`POSE_MODEL_URLS` (so pointing ``server.model`` at
+    ``pose_landmarker_full.task`` or ``..._heavy.task`` auto-downloads the
+    better, more landmark-stable model). Downloads to a temporary ``.part`` file
+    and atomically renames it into place only on success, so an interrupted
+    download never leaves a truncated, silently-cached model.
     """
     p = Path(path)
     if p.exists():
         return str(p)
+    if url is None:
+        url = POSE_MODEL_URLS.get(p.name)
+        if url is None:
+            raise ValueError(
+                f"no known download URL for pose model {p.name!r}; known: "
+                f"{sorted(POSE_MODEL_URLS)} (or pass an explicit url)")
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_suffix(p.suffix + ".part")
     print(f"[gesturewall] downloading pose model -> {p} ...")

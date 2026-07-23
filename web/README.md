@@ -60,6 +60,53 @@ Panel sliders: grid **rows/cols**, **dwell** time, 1-Euro **smooth** (min-cutoff
 and **beta**, plus **Mirror / Filter / Preview** toggles — same tuning knobs as
 the Python CLI flags.
 
+## Multi-wall / multi-user
+
+`index.html` is the standalone single-wall app (pose runs **in the browser**).
+For **several cameras / several walls / several people**, the heavy lifting moves
+to the Python server (`gesturewall.server`), and each projector loads the thin
+networked client **`wall.html`** instead. It does no camera work — it just
+subscribes to one wall's cursor stream and renders it.
+
+```
+Python: cameras → Tracker → FusionEngine → websocket (port 8770)
+Browser: wall.html?wall=A  ──ws──►  per-wall cursor stream
+```
+
+The shared pure-logic classes live in **`core.js`** (named exports:
+`OneEuroFilter`, `Point2DFilter`, `Zone`, `buildGrid`, `DwellSelector`,
+`Homography`, `WALL_CORNERS`, `CORNER_NAMES`). Both `gesturewall.js` (the
+single-wall app) and `wall.js` (the networked client) import from it, so their
+behaviour is identical.
+
+**Run it:**
+
+```bash
+# 1) fill room.json + calibrate on the hardware (see the repo root README), then:
+.venv/bin/python -m gesturewall.server --config room.json
+# serves this web/ dir over http AND the websocket fan-out.
+```
+
+**Open one client per projector** (same origin the server serves):
+
+```
+http://localhost:8000/wall.html?wall=A&server=ws://localhost:8770&rows=2&cols=3
+http://localhost:8000/wall.html?wall=B&server=ws://localhost:8770&rows=2&cols=3
+```
+
+URL params: `wall` (default `A`), `server` (default `ws://<host>:8770`), `rows`
+(default 2), `cols` (default 3). Each cursor gets a distinct color (hue from id),
+its own smoothing + dwell ring + id badge; a **shared per-zone lock (~0.4 s)**
+prevents two people double-toggling the same tile. The HUD shows the user count
+and connection state, and the socket auto-reconnects.
+
+- **Mouse test:** move the mouse over the canvas to inject a local `id=-1` cursor
+  with no server connected. **`f`** toggles fullscreen.
+
+> Node checks for the pure logic: `node _core_check.mjs` (shared core —
+> Homography round-trip, 1-Euro steady-state, dwell toggle) and
+> `node _wall_check.mjs` (wall.js helpers + the shared zone-lock conflict rule).
+
 ## Notes
 
 - The pose model (~6 MB) and MediaPipe WASM load from a CDN on first run, so the

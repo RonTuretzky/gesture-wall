@@ -4,13 +4,25 @@
 //   pose wrist -> mirror -> homography (calibration) -> 1-Euro smoothing
 //   -> DwellSelector -> zone toggle, with raise-hand-to-engage gating.
 //
-// Pure-logic classes (OneEuroFilter, Zone, DwellSelector, Homography) are direct
-// translations of gesturewall/{filters,zones,dwell,calibration}.py.
+// Pure-logic classes (OneEuroFilter, Zone, DwellSelector, Homography) live in
+// ./core.js — a shared module ported from gesturewall/{filters,zones,dwell,
+// calibration}.py. This file keeps the camera/MediaPipe glue and the App.
 
 import {
   FilesetResolver,
   PoseLandmarker,
 } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+import {
+  OneEuroFilter,
+  Point2DFilter,
+  Zone,
+  buildGrid,
+  DwellSelector,
+  Homography,
+  WALL_CORNERS,
+  CORNER_NAMES,
+} from "./core.js";
 
 // BlazePose 33-landmark indices (same order as the Tasks API flat list).
 const LEFT_SHOULDER = 11, RIGHT_SHOULDER = 12;
@@ -21,204 +33,6 @@ const POSE_MODEL_URL =
   "pose_landmarker_lite/float16/latest/pose_landmarker_lite.task";
 const WASM_BASE =
   "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm";
-
-// --------------------------------------------------------------------------- //
-// 1-Euro filter  (port of filters.py)
-// --------------------------------------------------------------------------- //
-class LowPassFilter {
-  constructor(alpha) { this._setAlpha(alpha); this._s = null; }
-  _setAlpha(a) {
-    if (!(a > 0 && a <= 1)) throw new Error(`alpha must be in (0,1], got ${a}`);
-    this._alpha = a;
-  }
-  call(value, alpha) {
-    if (alpha != null) this._setAlpha(alpha);
-    const s = this._s == null ? value : this._alpha * value + (1 - this._alpha) * this._s;
-    this._s = s;
-    return s;
-  }
-  last() { return this._s; }
-}
-
-class OneEuroFilter {
-  constructor(freq = 60, mincutoff = 1.0, beta = 0.0, dcutoff = 1.0) {
-    this._freq = freq; this._mincutoff = mincutoff; this._beta = beta; this._dcutoff = dcutoff;
-    this._x = new LowPassFilter(this._alpha(mincutoff));
-    this._dx = new LowPassFilter(this._alpha(dcutoff));
-    this._lasttime = null;
-  }
-  _alpha(cutoff) {
-    const te = 1 / this._freq;
-    const tau = 1 / (2 * Math.PI * cutoff);
-    return 1 / (1 + tau / te);
-  }
-  call(x, timestamp) {
-    if (this._lasttime != null && timestamp != null && timestamp > this._lasttime)
-      this._freq = 1 / (timestamp - this._lasttime);
-    this._lasttime = timestamp;
-    const prev = this._x.last();
-    const dx = prev == null ? 0 : (x - prev) * this._freq;
-    const edx = this._dx.call(dx, this._alpha(this._dcutoff));
-    const cutoff = this._mincutoff + this._beta * Math.abs(edx);
-    return this._x.call(x, this._alpha(cutoff));
-  }
-}
-
-class Point2DFilter {
-  constructor(freq = 60, mincutoff = 1.0, beta = 0.007, dcutoff = 1.0) {
-    this._fx = new OneEuroFilter(freq, mincutoff, beta, dcutoff);
-    this._fy = new OneEuroFilter(freq, mincutoff, beta, dcutoff);
-  }
-  call(x, y, timestamp) {
-    return [this._fx.call(x, timestamp), this._fy.call(y, timestamp)];
-  }
-}
-
-// --------------------------------------------------------------------------- //
-// Zones  (port of zones.py)
-// --------------------------------------------------------------------------- //
-class Zone {
-  constructor(id, label, x, y, w, h) {
-    this.id = id; this.label = label;
-    this.x = x; this.y = y; this.w = w; this.h = h;
-    this.selected = false;
-  }
-  contains(px, py, margin = 0) {
-    const mx = margin * this.w, my = margin * this.h;
-    return (this.x + mx <= px && px <= this.x + this.w - mx &&
-            this.y + my <= py && py <= this.y + this.h - my);
-  }
-}
-
-function buildGrid(rows, cols, padding = 0.06, labels = null) {
-  if (rows < 1 || cols < 1) throw new Error("rows and cols must be >= 1");
-  if (!(padding >= 0 && padding < 0.5)) throw new Error("padding must be in [0, 0.5)");
-  const zones = [];
-  const cellW = 1 / cols, cellH = 1 / rows;
-  let idx = 0;
-  for (let r = 0; r < rows; r++) {
-    for (let c = 0; c < cols; c++) {
-      const x = c * cellW + padding * cellW;
-      const y = r * cellH + padding * cellH;
-      const w = cellW * (1 - 2 * padding);
-      const h = cellH * (1 - 2 * padding);
-      const label = labels && idx < labels.length ? labels[idx] : String(idx + 1);
-      zones.push(new Zone(`r${r}c${c}`, label, x, y, w, h));
-      idx++;
-    }
-  }
-  return zones;
-}
-
-// --------------------------------------------------------------------------- //
-// Dwell-to-select state machine  (port of dwell.py)
-// --------------------------------------------------------------------------- //
-class DwellSelector {
-  constructor(dwellSeconds = 0.8, cooldownSeconds = 0.4, hysteresis = 0.15) {
-    if (dwellSeconds <= 0) throw new Error("dwellSeconds must be > 0");
-    if (cooldownSeconds < 0) throw new Error("cooldownSeconds must be >= 0");
-    if (!(hysteresis >= 0 && hysteresis < 0.5)) throw new Error("hysteresis must be in [0, 0.5)");
-    this.dwellSeconds = dwellSeconds;
-    this.cooldownSeconds = cooldownSeconds;
-    this.hysteresis = hysteresis;
-    this.activeZone = null;
-    this.progress = 0;
-    this._enterTime = null;
-    this._cooldownUntil = 0;
-  }
-  reset() { this.activeZone = null; this.progress = 0; this._enterTime = null; }
-  _resolveTarget(zones, x, y) {
-    if (this.activeZone && this.activeZone.contains(x, y, -this.hysteresis))
-      return this.activeZone;
-    const core = zones.find(z => z.contains(x, y, this.hysteresis));
-    if (core) return core;
-    return zones.find(z => z.contains(x, y)) || null;
-  }
-  update(zones, cursor, t, engaged = true) {
-    if (!engaged || cursor == null) { this.reset(); return null; }
-    if (t < this._cooldownUntil) {
-      this.activeZone = null; this.progress = 0; this._enterTime = null; return null;
-    }
-    const target = this._resolveTarget(zones, cursor[0], cursor[1]);
-    if (target == null) { this.reset(); return null; }
-    if (target !== this.activeZone) {
-      this.activeZone = target; this._enterTime = t; this.progress = 0; return null;
-    }
-    const elapsed = t - this._enterTime;
-    this.progress = Math.max(0, Math.min(1, elapsed / this.dwellSeconds));
-    if (elapsed >= this.dwellSeconds) {
-      target.selected = !target.selected;
-      const event = { zoneId: target.id, selected: target.selected };
-      this._cooldownUntil = t + this.cooldownSeconds;
-      this.reset();
-      return event;
-    }
-    return null;
-  }
-}
-
-// --------------------------------------------------------------------------- //
-// Homography  (port of calibration.py, with an in-JS getPerspectiveTransform)
-// --------------------------------------------------------------------------- //
-const WALL_CORNERS = [[0.05, 0.05], [0.95, 0.05], [0.95, 0.95], [0.05, 0.95]];
-const CORNER_NAMES = ["TOP-LEFT", "TOP-RIGHT", "BOTTOM-RIGHT", "BOTTOM-LEFT"];
-
-class Homography {
-  constructor(matrix = null) {
-    this.matrix = matrix || [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
-  }
-  static identity() { return new Homography(); }
-  apply(x, y) {
-    const m = this.matrix;
-    const denom = m[2][0] * x + m[2][1] * y + m[2][2];
-    if (Math.abs(denom) < 1e-12) return [x, y];
-    return [(m[0][0] * x + m[0][1] * y + m[0][2]) / denom,
-            (m[1][0] * x + m[1][1] * y + m[1][2]) / denom];
-  }
-  static fromCornerPoints(src, dst = WALL_CORNERS) {
-    if (src.length !== 4) throw new Error("exactly 4 source points are required");
-    let area = 0;
-    for (let i = 0; i < 4; i++) {
-      const [x1, y1] = src[i], [x2, y2] = src[(i + 1) % 4];
-      area += x1 * y2 - x2 * y1;
-    }
-    if (Math.abs(area) / 2 < 1e-6)
-      throw new Error("source points are degenerate (collinear/coincident)");
-    return new Homography(getPerspectiveTransform(src, dst));
-  }
-}
-
-// Solve the 8 homography params (h33 = 1) from 4 point correspondences.
-function getPerspectiveTransform(src, dst) {
-  const A = [], b = [];
-  for (let i = 0; i < 4; i++) {
-    const [x, y] = src[i], [u, v] = dst[i];
-    A.push([x, y, 1, 0, 0, 0, -x * u, -y * u]); b.push(u);
-    A.push([0, 0, 0, x, y, 1, -x * v, -y * v]); b.push(v);
-  }
-  const h = solveLinear(A, b);
-  return [[h[0], h[1], h[2]], [h[3], h[4], h[5]], [h[6], h[7], 1]];
-}
-
-// Gaussian elimination with partial pivoting for an n x n system.
-function solveLinear(A, b) {
-  const n = b.length;
-  const M = A.map((row, i) => [...row, b[i]]);
-  for (let col = 0; col < n; col++) {
-    let piv = col;
-    for (let r = col + 1; r < n; r++)
-      if (Math.abs(M[r][col]) > Math.abs(M[piv][col])) piv = r;
-    [M[col], M[piv]] = [M[piv], M[col]];
-    const d = M[col][col];
-    if (Math.abs(d) < 1e-12) throw new Error("singular system in homography solve");
-    for (let r = 0; r < n; r++) {
-      if (r === col) continue;
-      const f = M[r][col] / d;
-      for (let c = col; c <= n; c++) M[r][c] -= f * M[col][c];
-    }
-  }
-  return M.map((row, i) => row[n] / row[i]);
-}
 
 // --------------------------------------------------------------------------- //
 // Pose source — webcam + MediaPipe Tasks PoseLandmarker  (port of PoseSource)
@@ -268,6 +82,7 @@ const COLORS = {
   bg: "#18181c", zoneIdle: "#5a5a60", zoneSelected: "#46aa46",
   zoneActive: "#3cc8dc", text: "#ebebeb", cursor: "#3cc8dc",
   ringBg: "#46464c", ringFg: "#3cdcf0",
+  midline: "rgba(240,180,60,0.55)",
 };
 
 class App {
@@ -293,6 +108,10 @@ class App {
     this.landmarker = null;
     this.calibrating = false;
     this.calibCaptured = [];
+    this.autoCalib = false;          // auto mode: countdown per corner instead of SPACE
+    this.calibCountdownSec = 10;     // seconds to hold each corner before auto-capture
+    this._calibRemaining = 0;        // seconds left on the current corner (auto mode)
+    this._calibLastT = null;         // last tick time, for the countdown delta
     this.fps = 0; this._prev = performance.now() / 1000;
 
     this._rebuild();
@@ -357,17 +176,37 @@ class App {
   startCalibration() {
     this.calibrating = true;
     this.calibCaptured = [];
-    this.setStatus(`calibration: point at the ${CORNER_NAMES[0]} corner, then press SPACE`);
+    this._calibRemaining = this.calibCountdownSec;
+    this._calibLastT = null;
+    this.setStatus(this.autoCalib
+      ? `auto-calibration: hold on the ${CORNER_NAMES[0]} corner — captures in ${this.calibCountdownSec}s (SPACE to capture now)`
+      : `calibration: point at the ${CORNER_NAMES[0]} corner, then press SPACE`);
   }
 
-  _tickCalibration(read) {
+  _tickCalibration(read, t) {
     const clamp = v => Math.min(1, Math.max(0, v));
     const raw = read.pointer ? [clamp(read.pointer[0]), clamp(read.pointer[1])] : null;
-    this._drawCalibration(raw);
+    let countdown = null;
+    if (this.autoCalib) {
+      if (raw) {
+        // Only run the clock down while a pointer is visible (so it pauses if
+        // you step out of view). Capture whatever the pointer reads at zero.
+        if (this._calibLastT != null) this._calibRemaining -= (t - this._calibLastT);
+        this._calibLastT = t;
+        if (this._calibRemaining <= 0) { this._doCapture(raw); return; }
+        countdown = this._calibRemaining;
+      } else {
+        this._calibLastT = t;                 // keep the clock fresh; don't decrement
+        countdown = this._calibRemaining;
+      }
+    }
+    this._drawCalibration(raw, countdown);
   }
 
   _doCapture(raw) {
     this.calibCaptured.push([Math.min(1, Math.max(0, raw[0])), Math.min(1, Math.max(0, raw[1]))]);
+    this._calibRemaining = this.calibCountdownSec;   // reset the countdown for the next corner
+    this._calibLastT = null;
     const n = this.calibCaptured.length;
     if (n === 4) {
       try {
@@ -379,7 +218,9 @@ class App {
       }
       this.calibrating = false;
     } else {
-      this.setStatus(`captured ${n}/4 — now point at the ${CORNER_NAMES[n]} corner and hold`);
+      this.setStatus(this.autoCalib
+        ? `captured ${n}/4 — now hold on the ${CORNER_NAMES[n]} corner (${this.calibCountdownSec}s)`
+        : `captured ${n}/4 — now point at the ${CORNER_NAMES[n]} corner, then press SPACE`);
     }
   }
 
@@ -419,7 +260,7 @@ class App {
     }
 
     if (this.calibrating) {
-      this._tickCalibration(read);
+      this._tickCalibration(read, t);
     } else {
       const event = this.selector.update(this.zones, cursor, t, engaged);
       if (event) console.log(`[gesturewall] ${event.selected ? "SELECT" : "DESELECT"} ${event.zoneId}`);
@@ -452,6 +293,8 @@ class App {
       ctx.fillText(z.label, x1 + w / 2, y1 + h / 2);
     }
 
+    this._drawHalfwayMarkers();
+
     if (engaged && cursor) this._drawCursor(cursor[0] * W, cursor[1] * H, this.selector.progress);
 
     const statusTxt = engaged ? "ENGAGED" : "idle (raise hand / move mouse in)";
@@ -459,6 +302,25 @@ class App {
     ctx.font = `${Math.round(H * 0.025)}px system-ui, sans-serif`;
     ctx.textAlign = "left"; ctx.textBaseline = "top";
     ctx.fillText(`${this.mode} | ${statusTxt} | ${this.fps.toFixed(1)} fps`, W * 0.012, H * 0.02);
+  }
+
+  // Dashed cross through the screen centre, marking the horizontal and vertical
+  // halfway points, with a small ring + tick labels at the very middle.
+  _drawHalfwayMarkers() {
+    const ctx = this.ctx, W = this.canvas.width, H = this.canvas.height;
+    const cx = W / 2, cy = H / 2;
+    ctx.save();
+    ctx.strokeStyle = COLORS.midline;
+    ctx.lineWidth = Math.max(1, Math.round(H * 0.002));
+    ctx.setLineDash([14, 12]);
+    ctx.beginPath();
+    ctx.moveTo(cx, 0); ctx.lineTo(cx, H);   // vertical midline (½ width)
+    ctx.moveTo(0, cy); ctx.lineTo(W, cy);   // horizontal midline (½ height)
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = COLORS.midline;
+    ctx.beginPath(); ctx.arc(cx, cy, Math.max(5, H * 0.01), 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
   }
 
   _drawCursor(cx, cy, progress) {
@@ -478,7 +340,7 @@ class App {
   // Interactive corner calibration: a pulsing labeled target shows which corner
   // to point at, others are dim/numbered, captured ones get a green check, and a
   // guide line connects the live cursor to the active target. Press SPACE to capture.
-  _drawCalibration(raw) {
+  _drawCalibration(raw, countdown = null) {
     const ctx = this.ctx, W = this.canvas.width, H = this.canvas.height;
     const pulse = 0.5 + 0.5 * Math.sin(performance.now() * 0.006);
     const idx = this.calibCaptured.length;
@@ -524,6 +386,11 @@ class App {
         ctx.textAlign = dir[0] > 0 ? "left" : "right"; ctx.textBaseline = "middle";
         ctx.fillStyle = COLORS.ringFg;
         ctx.fillText(CORNER_NAMES[i], x + dir[0] * H * 0.06, y + dir[1] * H * 0.06);
+        if (countdown != null) {                       // auto mode: big countdown
+          ctx.font = `bold ${Math.round(H * 0.06)}px system-ui, sans-serif`;
+          ctx.fillStyle = "#fff";
+          ctx.fillText(`${Math.ceil(countdown)}`, x + dir[0] * H * 0.06, y + dir[1] * H * 0.06 + H * 0.065);
+        }
       } else {                                         // pending -> dim numbered ring
         ctx.strokeStyle = "#55555f"; ctx.lineWidth = 3;
         ctx.beginPath(); ctx.arc(x, y, H * 0.02, 0, Math.PI * 2); ctx.stroke();
@@ -538,7 +405,8 @@ class App {
       const [cx, cy] = px(raw), [tx, ty] = px(WALL_CORNERS[idx]);
       ctx.strokeStyle = "rgba(255,255,255,0.18)"; ctx.lineWidth = 2; ctx.setLineDash([6, 8]);
       ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(tx, ty); ctx.stroke(); ctx.setLineDash([]);
-      this._drawCursor(cx, cy, 0);
+      const prog = countdown != null ? Math.min(1, Math.max(0, 1 - countdown / this.calibCountdownSec)) : 0;
+      this._drawCursor(cx, cy, prog);
     }
 
     // Header + sub-instruction + footer.
@@ -549,13 +417,17 @@ class App {
     ctx.font = `${Math.round(H * 0.026)}px system-ui, sans-serif`;
     ctx.fillStyle = raw ? COLORS.ringFg : "#9a9ad0";
     ctx.fillText(
-      raw ? `Point at the ${CORNER_NAMES[idx]} corner, then press SPACE`
-          : (this.mode === "POSE" ? "Step into the camera view" : "Move the mouse to begin"),
+      raw ? (this.autoCalib
+              ? `Hold on the ${CORNER_NAMES[idx]} corner — capturing in ${Math.ceil(countdown ?? this.calibCountdownSec)}s`
+              : `Point at the ${CORNER_NAMES[idx]} corner, then press SPACE`)
+          : (this.mode === "POSE" ? "Step into the camera view (timer paused)" : "Move the mouse to begin"),
       W / 2, H * 0.03 + H * 0.05);
     ctx.textBaseline = "bottom";
     ctx.font = `${Math.round(H * 0.022)}px system-ui, sans-serif`;
     ctx.fillStyle = "#bcbcc6";
-    ctx.fillText("Point at the highlighted corner · press SPACE to capture · Esc to cancel", W / 2, H - H * 0.03);
+    ctx.fillText(this.autoCalib
+      ? "Auto: hold each corner until the timer reaches 0 · SPACE captures now · Esc cancels"
+      : "Point at the highlighted corner · press SPACE to capture · Esc to cancel", W / 2, H - H * 0.03);
   }
 
   _drawPreview() {
@@ -601,6 +473,13 @@ class App {
     };
     $("filter").onchange = e => { this.useFilter = e.target.checked; this._rebuild(); };
     $("previewToggle").onchange = e => { this.showPreview = e.target.checked; };
+    const autoEl = $("autoCalib");
+    if (autoEl) autoEl.onchange = e => { this.autoCalib = e.target.checked; };
+    const autoSecsEl = $("autoSecs");
+    if (autoSecsEl) autoSecsEl.oninput = () => {
+      this.calibCountdownSec = parseInt(autoSecsEl.value);
+      const out = $("autoSecsVal"); if (out) out.textContent = autoSecsEl.value;
+    };
 
     // Mouse drives the cursor in mouse-test mode.
     this.canvas.addEventListener("mousemove", e => {
