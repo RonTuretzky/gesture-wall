@@ -13,7 +13,6 @@ from __future__ import annotations
 import argparse
 import time
 
-from .arcade import ArcadeStickSource
 from .calibration import CORNER_NAMES, WALL_CORNERS, Homography
 from .dwell import DwellSelector
 from .filters import Point2DFilter
@@ -173,10 +172,6 @@ def calibrate_pose(source: PoseSource, width: int, height: int,
 def _build_source(args) -> PointerSource:
     if args.source == "mouse":
         return MouseSource()
-    if args.source == "arcade":
-        return ArcadeStickSource(index=args.stick_index, speed=args.stick_speed,
-                                 deadzone=args.stick_deadzone,
-                                 engage_button=args.stick_button)
     return PoseSource(camera=args.camera, video=args.video,
                       model_path=args.model, mirror=not args.no_mirror,
                       min_confidence=args.min_confidence)
@@ -330,11 +325,20 @@ def build_parser() -> argparse.ArgumentParser:
                    default=0.4, help="analog dead zone, 0..1 (arcade)")
     p.add_argument("--stick-button", dest="stick_button", type=int, default=-1,
                    help="button index that engages the pointer; -1 = any (arcade)")
+    p.add_argument("--stick-dpad", dest="stick_dpad", default=None,
+                   help="lever button indices 'up,down,left,right' if your stick "
+                        "maps the lever differently (arcade; default 11,12,13,14)")
     return p
 
 
 def main(argv=None) -> None:
     args = build_parser().parse_args(argv)
+    if args.source == "arcade":
+        # Arcade mode runs its own pygame window (cv2 and pygame can't share a
+        # process on macOS, and the stick needs a focused SDL window).
+        from .arcade import run_arcade
+        run_arcade(args)
+        return
     run(args)
 
 

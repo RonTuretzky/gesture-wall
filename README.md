@@ -81,12 +81,22 @@ pip install pygame                       # one-time, only needed for this mode
 python3 run.py --source arcade
 python3 run.py --source arcade --dwell 0.2 --stick-speed 1.2   # snappier
 ```
-Drive the wall with a physical stick instead of a camera: the lever moves the
+Drive the wall with a physical stick instead of a camera. The lever moves a
 cursor (velocity-integrated — hold it and the cursor glides), and holding any
-button engages the pointer so the dwell ring fills and toggles the tile. No
-calibration needed — the stick reports directly in wall coordinates. Put the
-stick in a controller mode your OS recognizes (on macOS, D-input/macOS mode); it
-is auto-detected by name, or pass `--stick-index N` to pick a specific device.
+action button selects the tile under the cursor (the dwell ring fills, then it
+toggles). No calibration needed — the stick reports directly in wall
+coordinates.
+
+Setup notes (learned on macOS):
+- Set the stick's **mode switch to `S` (Switch)**. macOS then exposes it via
+  SDL as a *Nintendo Switch Pro Controller*, and the lever comes through as the
+  D-pad. (`X`/XInput mode is Windows-only and won't enumerate on macOS.)
+- Arcade mode runs its **own pygame window** (OpenCV and pygame can't share a
+  process on macOS). Keep that window focused — macOS only delivers controller
+  input to the frontmost app.
+- The device is auto-detected by name; pass `--stick-index N` to pick a specific
+  one. If your lever maps to different button indices, override them with
+  `--stick-dpad up,down,left,right`.
 
 ## Controls
 
