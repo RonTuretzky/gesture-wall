@@ -7,5 +7,10 @@ opencv-python>=4.8
 # If your Python version has no mediapipe wheel, the mouse mode + tests still run.
 mediapipe>=0.10.9
 
+# Arcade-stick input — required only for `--source arcade` (8BitDo Arcade Stick,
+# model 80fe). Reads the lever + buttons as an HID gamepad. Mouse mode + tests
+# run without it.
+pygame>=2.5
+
 # Dev/test only:
 #   pip install pytest

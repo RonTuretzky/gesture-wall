@@ -75,6 +75,29 @@ On first run with `--source pose`, the PoseLandmarker model is auto-downloaded
 to `models/`. Calibration is a one-time "point at each of the 4 corners and press
 SPACE" step; the result is saved to `calibration.json` and reused next time.
 
+**Arcade-stick mode (8BitDo Arcade Stick, model 80fe):**
+```bash
+pip install pygame                       # one-time, only needed for this mode
+python3 run.py --source arcade
+python3 run.py --source arcade --dwell 0.2 --stick-speed 1.2   # snappier
+```
+Drive the wall with a physical stick instead of a camera. The lever moves a
+cursor (velocity-integrated — hold it and the cursor glides), and holding any
+action button selects the tile under the cursor (the dwell ring fills, then it
+toggles). No calibration needed — the stick reports directly in wall
+coordinates.
+
+Setup notes (learned on macOS):
+- Set the stick's **mode switch to `S` (Switch)**. macOS then exposes it via
+  SDL as a *Nintendo Switch Pro Controller*, and the lever comes through as the
+  D-pad. (`X`/XInput mode is Windows-only and won't enumerate on macOS.)
+- Arcade mode runs its **own pygame window** (OpenCV and pygame can't share a
+  process on macOS). Keep that window focused — macOS only delivers controller
+  input to the frontmost app.
+- The device is auto-detected by name; pass `--stick-index N` to pick a specific
+  one. If your lever maps to different button indices, override them with
+  `--stick-dpad up,down,left,right`.
+
 ## Controls
 
 | Key | Action |
@@ -83,11 +106,12 @@ SPACE" step; the result is saved to `calibration.json` and reused next time.
 | `r` | reset all selections |
 | `c` | (pose) run corner calibration |
 | `SPACE` | (during calibration) capture the current corner |
+| lever / button | (arcade) move the cursor / hold to engage |
 
 ## Useful options
 
 ```
---source {mouse,pose}     input (default: mouse)
+--source {mouse,pose,arcade}  input (default: mouse)
 --rows N --cols N         tile grid (default 2 x 3)
 --labels A,B,C,D,E,F      custom tile labels
 --dwell 0.8               seconds to hold for a selection
@@ -99,6 +123,10 @@ SPACE" step; the result is saved to `calibration.json` and reused next time.
 --no-mirror / --no-preview pose display options
 --fullscreen              fullscreen (pose) — for the actual projector
 --width 1280 --height 720 wall resolution
+--stick-index N           (arcade) joystick to use; default auto-selects
+--stick-speed 0.9         (arcade) cursor speed, fraction of the wall per second
+--stick-deadzone 0.4      (arcade) analog dead zone (0..1)
+--stick-button -1         (arcade) engage button index; -1 = any button
 ```
 
 ## Tuning
